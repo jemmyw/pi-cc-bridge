@@ -1,8 +1,8 @@
-import { appendFileSync, readFileSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { Bridge } from "./bridge.ts";
 import { bridgeStateDir, loadConfig } from "./config.ts";
-import { tryLock } from "./daemon-lock.ts";
+import { releaseLock, tryLock } from "./daemon-lock.ts";
 
 const MAX_LOG_BYTES = 16 * 1024 * 1024; // rotate to daemon.log.1; keeps runaway logging bounded
 
@@ -60,7 +60,7 @@ export async function runDaemon(argv: string[] = process.argv.slice(2)): Promise
   }
   process.on("exit", () => {
     try {
-      if (readFileSync(lockPath, "utf-8").startsWith(`${process.pid} `)) unlinkSync(lockPath);
+      releaseLock(lockPath);
     } catch {
       /* best effort */
     }

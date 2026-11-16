@@ -49,11 +49,13 @@
     "start": "tsx src/cli.ts",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "build": "esbuild src/cli.ts --bundle --platform=node --format=esm --outfile=dist/cli.mjs && esbuild src/holder.ts --bundle --platform=node --format=esm --outfile=dist/holder.mjs",
+    "build": "esbuild src/cli.ts --external:fs-ext --bundle --platform=node --format=esm --outfile=dist/cli.mjs && esbuild src/holder.ts --bundle --platform=node --format=esm --outfile=dist/holder.mjs",
     "prepublishOnly": "npm run typecheck && npm run build && npm test",
     "prepare": "npm run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "fs-ext": "2.1.1"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },

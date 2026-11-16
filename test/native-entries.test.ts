@@ -8,8 +8,8 @@ import net from "node:net";
 import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { startIsolatedBroker, resolveTsx, waitFor, BROKER_ENTRY, SKIP, SKIP_REASON } from "./helpers.ts";
-import { BrokerClient } from "../src/intercom/client.ts";
-import { buildOutboundLine } from "../src/cc/protocol.ts";
+import { BrokerClient, type BrokerEvent } from "../src/intercom/client.ts";
+import { buildOutboundLine, parseInboundLine } from "../src/cc/protocol.ts";
 
 /**
  * Native-entries integration: a fully SYNTHETIC CC↔pi loop.
@@ -239,4 +239,94 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+for (const native of [true, false]) {
+  test(`ask correlation: ${native ? "native" : "funnel"} routes use explicit tokens and broker replyTo`, { skip: SKIP_REASON }, async t => {
+    const fixture = await setupFixture();
+    const configPath = join(fixture.agentDir, "pi-cc-bridge", "config.json");
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    writeFileSync(configPath, JSON.stringify({ ...config, maxHolders: native ? 1 : 0, relayBurst: 32, relayPerMin: 120 }));
+    const planner = new BrokerClient(fixture.agentDir);
+    const messages: Extract<BrokerEvent, { type: "message" }>[] = [];
+    let peerReady = false;
+    planner.on("session_joined", event => { if (event.session.name === "claude:test-cc") peerReady = true; });
+    planner.on("message", event => { messages.push(event); planner.receipt(event.message.id); });
+    await planner.connectAndRegister("planner-id", {
+      name: "planner", cwd: process.cwd(), model: "test", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(), status: "idle", livenessIntervalMs: 5000,
+    });
+    const daemon = startDaemon(fixture.agentDir);
+    t.after(async () => {
+      planner.close();
+      daemon.kill("SIGTERM");
+      await waitFor(() => daemon.exitCode !== null || daemon.signalCode !== null);
+      fixture.cleanup();
+    });
+    assert.ok(await waitFor(() => peerReady));
+    if (native) assert.ok(await waitFor(() => readHolderPidFor(fixture.agentDir, "pi-planner") !== undefined));
+    const daemonRecord = JSON.parse(readFileSync(join(fixture.sessionsDir, `${daemon.pid}.json`), "utf-8"));
+    const holderPid = readHolderPidFor(fixture.agentDir, "pi-planner");
+    const inbox = native
+      ? JSON.parse(readFileSync(join(fixture.sessionsDir, `${holderPid}.json`), "utf-8")).messagingSocketPath
+      : daemonRecord.messagingSocketPath;
+    const post = async (text: string, msgId: string) => {
+      const line = buildOutboundLine({ senderSocketPath: fixture.mySocketPath, senderName: "renamed-cc-label",
+        senderMode: "prompting", text: native ? text : `To: planner\n${text}`, msgId });
+      await new Promise<void>((resolve, reject) => {
+        const socket = net.createConnection(inbox);
+        socket.once("connect", () => socket.end(`${line}\n`));
+        socket.once("error", reject);
+        socket.once("close", () => resolve());
+      });
+    };
+    const tokens: string[] = [];
+    for (let n = 1; n <= 2; n++) {
+      planner.send("claude:test-cc", { id: `ask-${n}`, expectsReply: true, timestamp: Date.now(), content: { text: `question-${n}` } });
+      assert.ok(await waitFor(() => fixture.myLines.some(line => line.includes(`question-${n}`))));
+      const frame = parseInboundLine(fixture.myLines.find(line => line.includes(`question-${n}`))!);
+      assert.equal(frame.kind, "user");
+      if (frame.kind !== "user") return;
+      const token = /Bridge-Reply: ([0-9a-f-]{36})/.exec(frame.text)?.[1];
+      assert.ok(token);
+      tokens.push(token);
+      assert.equal(frame.line.from, native ? inbox : daemonRecord.messagingSocketPath);
+    }
+    assert.notEqual(tokens[0], tokens[1]);
+    await post("unrelated notification", "notification");
+    assert.ok(await waitFor(() => messages.some(event => event.message.id === "notification")));
+    assert.equal(messages.find(event => event.message.id === "notification")!.message.replyTo, undefined);
+    await post(`Bridge-Reply: ${tokens[1]}\nsecond answer`, "reply-2");
+    await post(`Bridge-Reply: ${tokens[0]}\nfirst answer`, "reply-1");
+    assert.ok(await waitFor(() => messages.filter(event => event.message.replyTo).length === 2));
+    assert.equal(messages.find(event => event.message.id === "reply-2")!.message.replyTo, "ask-2");
+    assert.equal(messages.find(event => event.message.id === "reply-1")!.message.replyTo, "ask-1");
+    assert.match(messages.find(event => event.message.id === "reply-1")!.message.content.text, /\nfirst answer$/);
+    assert.ok(!messages.find(event => event.message.id === "reply-1")!.message.content.text.includes("Bridge-Reply:"));
+    await post(`Bridge-Reply: ${tokens[1]}\nduplicate`, "duplicate");
+    assert.ok(await waitFor(() => readdirSync(join(fixture.agentDir, "pi-cc-bridge", "held")).some(file => file.includes("invalid-ask-reply"))));
+    assert.equal(messages.some(event => event.message.id === "duplicate"), false);
+
+    let cancelledDeliveryAcks = 0;
+    planner.on("delivered", event => { if (event.messageId === "cancelled-ask") cancelledDeliveryAcks++; });
+    planner.send("claude:test-cc", { id: "cancelled-ask", expectsReply: true, timestamp: Date.now(), content: { text: "cancelled question" } });
+    assert.ok(await waitFor(() => fixture.myLines.some(line => line.includes("cancelled question")) && cancelledDeliveryAcks >= 1));
+    const cancelledFrame = parseInboundLine(fixture.myLines.find(line => line.includes("cancelled question"))!);
+    assert.equal(cancelledFrame.kind, "user");
+    if (cancelledFrame.kind !== "user") return;
+    const cancelledToken = /Bridge-Reply: ([0-9a-f-]{36})/.exec(cancelledFrame.text)![1];
+    // Exercise the real 0.18.1 broker control frame without exposing a new public API.
+    planner["rawSend"]({ type: "cancel_message", messageId: "cancelled-ask" });
+    assert.ok(await waitFor(() => cancelledDeliveryAcks >= 2));
+    await sleep(100);
+    const beforeCancelledReply = readdirSync(join(fixture.agentDir, "pi-cc-bridge", "held")).length;
+    await post(`Bridge-Reply: ${cancelledToken}\nlate cancelled reply`, "cancelled-reply");
+    assert.ok(await waitFor(() => readdirSync(join(fixture.agentDir, "pi-cc-bridge", "held")).length > beforeCancelledReply));
+    assert.equal(messages.some(event => event.message.replyTo === "cancelled-ask"), false);
+
+    await new Promise<void>(resolve => fixture.myServer.close(() => resolve()));
+    planner.send("claude:test-cc", { id: "failed-ask", expectsReply: true, timestamp: Date.now(), content: { text: "transport failure" } });
+    assert.ok(await waitFor(() => messages.some(event => event.message.replyTo === "failed-ask")));
+    assert.match(messages.find(event => event.message.replyTo === "failed-ask")!.message.content.text, /Delivery failed/);
+  });
 }

@@ -23,6 +23,10 @@ export function isProbeMessage(event: ReceivedMessage, peer: { id: string; name:
     event.message.content.text === `Message from Claude Code session ${peer.name.slice("claude:".length)}:\n${text}`;
 }
 
+export function isProbeReply(event: ReceivedMessage, peer: { id: string; name: string }, text: string, replyTo: string): boolean {
+  return isProbeMessage(event, peer, text) && event.message.replyTo === replyTo;
+}
+
 export function assertNoPrematureAck(messages: ReceivedMessage[], peer: { id: string; name: string }, ack: string): void {
   if (messages.some(event => isProbeMessage(event, peer, ack))) throw new Error("premature ACK before pi to CC ping");
 }
@@ -201,8 +205,9 @@ export async function main(): Promise<void> {
     const prompt = `Use ListAgents to find the session named "${peerName}". Message only "${peerName}" and "${holderName}". ` +
       `Use SendMessage to send exactly "To: ${targetName}\\n${hello}" to it (replace \\n with a newline). ` +
       `Then use ListAgents to find "${holderName}" (retry discovery if not visible yet) and send exactly "${nativeHello}" to it. ` +
-      `When you receive a cross-session message from "${holderName}" whose text is exactly "${ping}", ` +
-      `use SendMessage to send exactly "${ack}" to "${holderName}". Do not send the ACK before receiving that message.`;
+      `When you receive a cross-session message from "${holderName}" whose last line is exactly "${ping}", ` +
+      `follow its Bridge ask instruction: send the exact Bridge-Reply token header on its own first line, then "${ack}" on the next line, to "${holderName}". ` +
+      `Do not send the ACK before receiving that message.`;
     cc.stdin!.on("error", error => { childFailure = error; });
     cc.stdin!.write(JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n");
 
@@ -223,9 +228,10 @@ export async function main(): Promise<void> {
     assertNoPrematureAck(messages, expected, ack);
     console.log("PASS no premature ACK before pi to CC ping");
     const beforeReply = messages.length;
-    target.send(expected.id, { id: randomUUID(), timestamp: Date.now(), content: { text: ping } });
-    await waitFor("pi to CC acknowledgement", () => messages.slice(beforeReply).some(event => isProbeMessage(event, expected, ack)), 120_000);
-    console.log("PASS native pi to CC: exact ACK received through broker from dedicated Claude peer");
+    const askId = randomUUID();
+    target.send(expected.id, { id: askId, expectsReply: true, timestamp: Date.now(), content: { text: ping } });
+    await waitFor("pi to CC correlated acknowledgement", () => messages.slice(beforeReply).some(event => isProbeReply(event, expected, ack, askId)), 120_000);
+    console.log("PASS native pi to CC ask: exact ACK and original replyTo received through broker from dedicated Claude peer");
     succeeded = true;
   } finally {
     const errors: unknown[] = [];

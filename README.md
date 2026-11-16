@@ -119,11 +119,39 @@ Directory ownership checks, private permissions, and messaging policies are unch
 
 ## Running the daemon manually
 
+The daemon requires `fs-ext` 2.1.1, built locally with node-gyp (Python, a C++
+compiler and Node headers). Normal npm installation builds it. If installing
+with lifecycle scripts disabled, review it then run `npm rebuild fs-ext` before
+starting the daemon. No native addon is loaded for extension status/stop checks.
+
 ```bash
 npm install
 npm run build        # dist/holder.mjs — plain-node holder children (~53MB vs ~82MB)
 npm start            # or: bin/pi-cc-bridge.mjs
 ```
+
+The daemon holds a kernel flock on the permanent private `daemon.lock.guard`
+file for its lifetime. Never delete that guard while any daemon is running.
+Normal exit removes only its own `daemon.lock` metadata; a crash releases flock
+automatically. Legacy live or unknown-owner metadata is preserved conservatively;
+stop older bridge versions before upgrading, as they do not honour the guard.
+
+## Blocking asks
+
+Intercom `ask` (`expectsReply: true`) adds a one-use `Bridge-Reply: <token>`
+instruction to the Claude message. Claude must return that exact first payload
+line with its answer, after any funnel `To:` line. The bridge validates the token,
+Claude session/endpoint and pi recipient before setting the original `replyTo`.
+Unrelated notifications never answer an ask; invalid, duplicate or late token
+replies are held. Ordinary sends are unchanged except that `Bridge-Reply:` is a
+reserved first payload line.
+
+Pending asks are capped at 256, without evicting active requests. Their timeout
+matches pi-intercom's 10-minute default or the daemon's
+`PI_INTERCOM_ASK_TIMEOUT_MS`. The bridge cannot know a different timeout in an
+individual pi session. Broker-expired/cancelled asks reject late replies rather
+than matching another request. Transport/capacity failures return a correlated
+failure reply; disconnects and daemon shutdown clear pending state.
 
 ## Tests
 
@@ -139,7 +167,8 @@ exact nonce messages received through the broker, not Claude stdout. Only the
 probe opts into `crossSessionInbound: "accept"` for that launch; bridge trust
 settings stay unchanged. Owned children and matching records are cleaned in
 `finally`; existing Claude sessions are never messaged. The smoke checks both
-funnel delivery and a native holder round-trip. Failure retains private diagnostic
+funnel delivery and a native holder round-trip with an actual blocking ask and
+original `replyTo` assertion. Failure retains private diagnostic
 tails and daemon logs in the reported temporary directory; success removes them.
 
 ## Memory-file sections

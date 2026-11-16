@@ -41,6 +41,7 @@ export interface IntercomMessage {
 
 export interface BrokerSessionInfo {
   id: string;
+  endpointEpoch?: string;
   name?: string;
   cwd: string;
   model: string;
@@ -59,6 +60,7 @@ export type BrokerEvent =
   | { type: "registered"; sessionId: string; features?: string[] }
   | { type: "sessions"; requestId: string; sessions: BrokerSessionInfo[] }
   | { type: "message"; from: BrokerSessionInfo; message: IntercomMessage }
+  | { type: "message_control"; from: BrokerSessionInfo; control: { action: "cancel" | "supersede"; messageId: string } }
   | { type: "delivered"; messageId: string }
   | { type: "delivery_failed"; messageId: string; reason: string }
   | { type: "message_receipt"; from: BrokerSessionInfo; receipt: MessageReceiptFrame }

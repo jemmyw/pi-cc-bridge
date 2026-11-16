@@ -11,8 +11,8 @@ import { verifiedLockPid } from "../src/daemon-lock.ts";
  * synthetic peers with pi-intercom's broker, so `claude:*` peers simply appear
  * in every intercom list on this machine.
  *
- * Hardened per critique P0-3/P1-15: the daemon self-locks (O_EXCL, `pid
- * procStart`), so spawning from every pi session is safe — losers exit 0.
+ * The daemon holds a kernel flock guard with `pid procStart` owner metadata,
+ * so spawning from every pi session is safe; losers exit 0.
  * Liveness is verified against procStart before a pid is trusted or signalled.
  */
 

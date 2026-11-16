@@ -14,7 +14,7 @@ import net from "node:net";
  * Lifecycle integration (critic P0-2/P0-3/P1-1):
  *  1. broker restart → peers re-register: the holder vanishes while the broker
  *     is down (peer disconnect → roster cleared) and returns after reconnect.
- *  2. two daemons racing → exactly one survives (O_EXCL lock).
+ *  2. two daemons racing → exactly one survives (kernel flock).
  *  3. holder SIGKILL → respawned with a fresh pid.
  */
 
@@ -120,7 +120,7 @@ test("lifecycle: broker restart, double daemon, holder crash", { skip }, async t
 
   let broker = await startBrokerAt(agentDir);
 
-  // Two daemons race: exactly one owns the lock (P0-3).
+  // Two daemons race: exactly one owns the guard (P0-3).
   const d1 = startDaemon(agentDir);
   const d2 = startDaemon(agentDir);
   t.after(() => {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { tryLock } from "../src/daemon-lock.ts";
+import { releaseLock, tryLock } from "../src/daemon-lock.ts";
 
 for (const { name, stored, actual, alive, expected } of [
   { name: "matching Darwin timestamp with spaces", stored: "Thu Nov 12 23:18:35 2026", actual: "Thu Nov 12 23:18:35 2026", alive: true, expected: false },
@@ -16,7 +16,10 @@ for (const { name, stored, actual, alive, expected } of [
 ]) {
   test(`tryLock: ${name}`, t => {
     const dir = mkdtempSync(join(tmpdir(), "ccbridge-lock-"));
-    t.after(() => rmSync(dir, { recursive: true, force: true }));
+    t.after(() => {
+      releaseLock(join(dir, "daemon.lock"));
+      rmSync(dir, { recursive: true, force: true });
+    });
     const path = join(dir, "daemon.lock");
     const original = `123 ${stored}`;
     writeFileSync(path, original, { mode: 0o600 });
@@ -28,7 +31,10 @@ for (const { name, stored, actual, alive, expected } of [
 
 test("tryLock: acquires once and refuses a second live owner", t => {
   const dir = mkdtempSync(join(tmpdir(), "ccbridge-lock-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => {
+      releaseLock(join(dir, "daemon.lock"));
+      rmSync(dir, { recursive: true, force: true });
+    });
   const path = join(dir, "daemon.lock");
   assert.equal(tryLock(path, () => {}), true);
   assert.equal(tryLock(path, () => {}), false);
@@ -36,10 +42,13 @@ test("tryLock: acquires once and refuses a second live owner", t => {
 
 test("tryLock: malformed locks are not evidence of a dead owner", t => {
   const dir = mkdtempSync(join(tmpdir(), "ccbridge-lock-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => {
+      releaseLock(join(dir, "daemon.lock"));
+      rmSync(dir, { recursive: true, force: true });
+    });
   const path = join(dir, "daemon.lock");
   for (const content of ["", "0 unknown", "-1 unknown", "not-a-pid unknown", "123"]) {
-    writeFileSync(path, content);
+    writeFileSync(path, content, { mode: 0o600 });
     assert.equal(tryLock(path, () => {}), false);
     assert.equal(readFileSync(path, "utf-8"), content);
   }

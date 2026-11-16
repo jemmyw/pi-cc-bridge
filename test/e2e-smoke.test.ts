@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assertNoPrematureAck, isProbeMessage } from "../scripts/e2e-smoke.ts";
+import { assertNoPrematureAck, isProbeMessage, isProbeReply } from "../scripts/e2e-smoke.ts";
 import type { BrokerEvent } from "../src/intercom/client.ts";
 
 test("e2e smoke: only exact broker delivery from the dedicated peer satisfies the nonce", () => {
@@ -12,6 +12,10 @@ test("e2e smoke: only exact broker delivery from the dedicated peer satisfies th
     message: { id: "message-1", timestamp: 1, content: { text: `Message from Claude Code session dedicated-probe:\n${nonce}` } },
   };
   assert.equal(isProbeMessage(event, peer, nonce), true);
+  assert.equal(isProbeReply(event, peer, nonce, "ask-1"), false);
+  const reply = { ...event, message: { ...event.message, replyTo: "ask-1" } };
+  assert.equal(isProbeReply(reply, peer, nonce, "ask-1"), true);
+  assert.equal(isProbeReply(reply, peer, nonce, "ask-2"), false);
   assert.doesNotThrow(() => assertNoPrematureAck([], peer, nonce));
   assert.throws(() => assertNoPrematureAck([event], peer, nonce), /premature ACK/);
   assert.doesNotThrow(() => assertNoPrematureAck([event], peer, "ACK another-nonce"));

@@ -174,7 +174,8 @@ is connected — that session.
 ```
 ~/.pi/agent/pi-cc-bridge/
 ├── config.json        # { enabled, peerName, pollMs, routeTo, logLevel, ccSessionsDir? }
-├── daemon.lock       # O_EXCL single-instance lock: `pid procStart` (P0-3)
+├── daemon.lock        # owner metadata: `pid procStart`
+├── daemon.lock.guard  # permanent private inode, kernel flock held for daemon lifetime
 ├── daemon.log
 └── held/              # unroutable CC messages
 ```
