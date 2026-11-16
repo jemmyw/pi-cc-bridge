@@ -4,14 +4,15 @@ import { lstatSync, mkdirSync, chmodSync } from "node:fs";
 
 /**
  * Filesystem layout of Claude Code's messaging surface, as captured on 2.1.296.
- * Socket: $XDG_RUNTIME_DIR/cc-socks/<pid>.sock (fallback /tmp/cc-socks-<uid>/).
+ * Socket: /tmp/cc-socks/<pid>.sock on macOS; on Linux,
+ * $XDG_RUNTIME_DIR/cc-socks/<pid>.sock (fallback /tmp/cc-socks-<uid>/).
  * Registry: <claude-config-dir>/sessions/<pid>.json (+ <pid>.<sha256(path)>.key).
  */
 
 export interface CcPathsOptions {
   /** Override for the CC sessions registry dir (tests). Defaults under CLAUDE_CONFIG_DIR or ~/.claude. */
   ccSessionsDir?: string;
-  /** Override for the runtime socket dir (tests). Defaults to XDG_RUNTIME_DIR. */
+  /** Override for the runtime socket dir (tests). Defaults to the platform's CC path. */
   socketDir?: string;
 }
 
@@ -28,6 +29,7 @@ export function ccSessionsDir(options: CcPathsOptions = {}): string {
 
 export function ccSocketDir(options: CcPathsOptions = {}): string {
   if (options.socketDir?.trim()) return options.socketDir;
+  if (process.platform === "darwin") return "/tmp/cc-socks";
   const runtime = process.env.XDG_RUNTIME_DIR?.trim();
   if (runtime) return join(runtime, "cc-socks");
   return `/tmp/cc-socks-${process.getuid?.() ?? 0}`;

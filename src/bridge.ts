@@ -1,6 +1,6 @@
 import { spawn, ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -11,11 +11,13 @@ import { startCcInbox, CcInboxServer } from "./cc/inbox.ts";
 import { postToCcInbox } from "./cc/poster.ts";
 import { ParsedInbound } from "./cc/protocol.ts";
 import { BrokerClient, IntercomMessage, BrokerSessionInfo } from "./intercom/client.ts";
-import { BridgeConfig, bridgeStateDir, loadConfig } from "./config.ts";
+import { BridgeConfig, bridgeStateDir } from "./config.ts";
 import { randomUUID as _uuid } from "node:crypto";
 void _uuid;
 import { allocateHolderAlias, aliasExposed, derivedCcName, isFallbackAlias, matchTarget, parseToHeader, routeFunnel, toCcStatus } from "./routing.ts";
 import { RateLimiter } from "./ratelimit.ts";
+export { tryLock } from "./daemon-lock.ts";
+export { runDaemon } from "./daemon.ts";
 
 /**
  * The daemon: discovery loop + relay + holder supervision.
@@ -56,7 +58,6 @@ interface HolderState {
 }
 
 const HOLDER_LINE = 10; // \n
-const MAX_LOG_BYTES = 16 * 1024 * 1024; // rotate to daemon.log.1; keeps runaway logging bounded
 const MAX_RELAY_BYTES = 900 * 1024; // below CC's ~1M-char refusal (P1-7)
 const SPAWN_COOLDOWN_MS = 10_000;
 const MAX_CRASHES = 5;
@@ -940,132 +941,4 @@ function senderLabel(sender: { name?: string; cwd?: string; id: string }): strin
 
 function ccNameFor(peer: Peer): string {
   return peer.cc.name?.trim() ? peer.cc.name.trim() : `pid-${peer.cc.pid}`;
-}
-
-// ── Single instance lock + CLI entry ────────────────────────────────────────
-
-/** O_EXCL lock storing `pid procStart`; stale files are renamed away by one winner (P0-3). */
-export function tryLock(lockPath: string, log: (m: string) => void): boolean {
-  const content = `${process.pid} ${procStart() ?? "unknown"}`;
-  try {
-    writeFileSync(lockPath, content, { flag: "wx", mode: 0o600 });
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    try {
-      const [pid, start] = readFileSync(lockPath, "utf-8").trim().split(" ");
-      if (isPidAlive(Number(pid)) && procStart(Number(pid)) === start) return false; // live owner
-    } catch {
-      return false;
-    }
-    try {
-      renameSync(lockPath, `${lockPath}.stale.${process.pid}`);
-    } catch {
-      return false; // only one taker wins the rename race
-    }
-    try {
-      writeFileSync(lockPath, content, { flag: "wx", mode: 0o600 });
-      log(`took over stale daemon lock (previous pid dead)`);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-}
-
-/** CLI entry: run the bridge until signalled. */
-export async function runDaemon(argv: string[] = process.argv.slice(2)): Promise<void> {
-  // P3-1: explicit flags only — a bare positional once created `./--help/`.
-  let agentDirOverride: string | undefined;
-  for (const arg of argv) {
-    if (arg.startsWith("--agent-dir=")) agentDirOverride = arg.slice("--agent-dir=".length);
-    else {
-      process.stderr.write(`pi-cc-bridge: unknown argument ${arg} (usage: pi-cc-bridge [--agent-dir=<path>])\n`);
-      process.exit(2);
-    }
-  }
-  const stateDir = bridgeStateDir(agentDirOverride);
-  const config = loadConfig(stateDir);
-  const logFile = join(stateDir, "daemon.log");
-  let stdoutBroken = false;
-  const log = (msg: string) => {
-    // Logging must never throw — an EPIPE on a dead parent's stdout pipe once
-    // looped through uncaughtException and wrote 19GB/hour to disk.
-    const line = `${new Date().toISOString()} ${msg}`;
-    try {
-      let size = 0;
-      try {
-        size = statSync(logFile).size; // missing file is fine: append creates it
-      } catch {
-        size = 0;
-      }
-      if (size > MAX_LOG_BYTES) {
-        try {
-          unlinkSync(`${logFile}.1`);
-        } catch {
-          /* first rotation */
-        }
-        renameSync(logFile, `${logFile}.1`); // rotate: keep one generation, stay bounded
-      }
-      appendFileSync(logFile, `${line}\n`);
-    } catch {
-      /* disk full or gone: drop the line, keep running */
-    }
-    if (!stdoutBroken && config.logLevel !== "quiet") {
-      try {
-        process.stdout.write(`${line}\n`);
-      } catch {
-        stdoutBroken = true; // pipe died: stop attempting, never throw
-      }
-    }
-  };
-
-  const lockPath = join(stateDir, "daemon.lock");
-  if (!tryLock(lockPath, log)) {
-    log("another daemon owns the lock; exiting");
-    process.exit(0);
-  }
-  process.on("exit", () => {
-    try {
-      if (readFileSync(lockPath, "utf-8").startsWith(`${process.pid} `)) unlinkSync(lockPath);
-    } catch {
-      /* best effort */
-    }
-  });
-
-  if (!config.enabled) {
-    log("disabled in config; exiting");
-    process.exit(0);
-  }
-
-  const bridge = new Bridge(config, log, {
-    ccSessionsDir: config.ccSessionsDir,
-    socketDir: config.ccSocketDir,
-  });
-  const shutdown = (signal: string) => {
-    log(`received ${signal}`);
-    void bridge.stop().then(() => process.exit(0));
-  };
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("uncaughtException", error => {
-    // One line, best-effort; must never recurse through logging. Then exit:
-    // running on in an unknown state is worse than a supervised restart (P3-10).
-    try {
-      log(`uncaught: ${error.stack ?? error.message}`);
-    } catch {
-      /* drop */
-    }
-    log("shutting down after uncaught exception; the extension will restart this daemon");
-    void bridge.stop().then(() => process.exit(1));
-  });
-
-  try {
-    await bridge.start();
-    log("bridge running");
-  } catch (error) {
-    log(`start failed: ${(error as Error).message}`);
-    void bridge.stop().catch(() => {});
-    process.exit(1);
-  }
 }

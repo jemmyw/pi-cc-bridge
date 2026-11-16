@@ -1,5 +1,6 @@
 import { readFileSync, readdirSync, writeFileSync, unlinkSync, existsSync, renameSync, readlinkSync, lstatSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { CcRecord, ccSessionsDir, CcPathsOptions, BRIDGE_OWNER } from "./paths.ts";
 
@@ -60,13 +61,20 @@ export function listRecordsSync(options: CcPathsOptions = {}): { record: CcRecor
 }
 
 /**
- * /proc/<pid>/stat field 22 (starttime, pages since boot), as CC records it.
+ * Darwin uses UTC ps lstart; Linux uses /proc/<pid>/stat field 22 (ticks since boot).
  * After "(comm)" the remainder begins with the field-3 separator; a leading
  * space would make element 0 empty and shift every index — trim first.
  * (P0-1: the missing trim made this return field 21, `itrealvalue`, always "0".)
  */
 export function procStart(pid: number = process.pid): string | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   try {
+    if (process.platform === "darwin") {
+      return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+        encoding: "utf-8",
+        env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      }).trim() || undefined;
+    }
     const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
     return stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19];
   } catch {
@@ -99,6 +107,7 @@ export function machineIdHash(): string | undefined {
  * — same machine, same pid namespace — and only compute a fallback otherwise.
  */
 export function pidDomainFor(records: { record: CcRecord }[]): string {
+  if (process.platform === "darwin") return "darwin";
   const ns = procNsPid();
   const live = records.find(
     r => r.record.kind !== "bridge" && typeof r.record.pidDomain === "string" && r.record.pidDomain.endsWith(`:pid:[${ns ?? ""}]`),

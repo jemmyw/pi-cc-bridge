@@ -71,6 +71,7 @@
     "node": ">=20.6"
   },
   "os": [
-    "linux"
+    "linux",
+    "darwin"
   ]
 }

@@ -3,7 +3,7 @@
 ![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![node](https://img.shields.io/badge/node-%E2%89%A520.6-brightgreen)
-![platform](https://img.shields.io/badge/platform-linux-lightgrey)
+![platform](https://img.shields.io/badge/platform-linux%20%7C%20macOS-lightgrey)
 ![Claude Code](https://img.shields.io/badge/Claude_Code-%E2%89%A52.1.224-orange)
 ![pi-intercom](https://img.shields.io/badge/pi--intercom-%E2%89%A50.17-purple)
 
@@ -90,6 +90,15 @@ The pi side of this bridge exists because of
 speaks its broker protocol, and its clean, client-asserted registration meant this could
 be a companion package rather than a fork. Zero changes were needed on pi-intercom's side.
 
+## Platforms
+
+Linux and macOS are supported. On macOS, native Claude Code identity uses
+`pidDomain: "darwin"` and the UTC, C-locale `ps -o lstart=` timestamp; sockets default
+to `/tmp/cc-socks`. Linux retains its `/proc` identity and
+`$XDG_RUNTIME_DIR/cc-socks` default (fallback `/tmp/cc-socks-<uid>`).
+Explicit socket-directory overrides take precedence on both platforms.
+Directory ownership checks, private permissions, and messaging policies are unchanged.
+
 ## Configuration
 
 `~/.pi/agent/pi-cc-bridge/config.json` (all optional):
@@ -122,6 +131,16 @@ npm start            # or: bin/pi-cc-bridge.mjs
 npm run typecheck
 npm test             # protocol fixtures from live captures + broker client integration
 ```
+
+Manual live round-trip: `npx tsx scripts/e2e-smoke.ts` (requires `claude` and
+pi-intercom). `PI_INTERCOM_DIR` and `TSX_LOADER` override dependency paths.
+It uses a temporary broker, uniquely named funnel and Claude probe, and checks
+exact nonce messages received through the broker, not Claude stdout. Only the
+probe opts into `crossSessionInbound: "accept"` for that launch; bridge trust
+settings stay unchanged. Owned children and matching records are cleaned in
+`finally`; existing Claude sessions are never messaged. The smoke checks both
+funnel delivery and a native holder round-trip. Failure retains private diagnostic
+tails and daemon logs in the reported temporary directory; success removes them.
 
 ## Memory-file sections
 

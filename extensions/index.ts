@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync, statSync, unlinkSync } from "nod
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { verifiedLockPid } from "../src/daemon-lock.ts";
 
 /**
  * pi-cc-bridge extension (thin): supervises the bridge daemon and exposes
@@ -26,26 +27,8 @@ function lockPath(): string {
   return join(stateDir(), "daemon.lock");
 }
 
-/** Only trust a lock pid whose procStart matches the recorded one. */
 function daemonPid(): number | undefined {
-  try {
-    const [p, s] = readFileSync(lockPath(), "utf-8").trim().split(" ");
-    const pid = Number(p);
-    if (!Number.isFinite(pid)) return undefined;
-    process.kill(pid, 0);
-    if (s && s !== "unknown") {
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-        const real = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/)[19];
-        if (real !== s) return undefined; // pid recycled by another process
-      } catch {
-        return undefined;
-      }
-    }
-    return pid;
-  } catch {
-    return undefined;
-  }
+  return verifiedLockPid(lockPath());
 }
 
 function nodeCommand(): string {

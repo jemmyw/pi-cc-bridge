@@ -67,9 +67,7 @@ export type BrokerEvent =
   | { type: "presence_update"; session: BrokerSessionInfo }
   | { type: "error"; error: string; code?: string };
 
-/** Broker connect target: the Unix socket. This package requires /proc and
- * /etc/machine-id (see package.json "os"), so the broker's TCP fallback
- * (Windows) is out of scope — and it would need a stateId on register (P3-4). */
+/** Linux and macOS use the Unix socket; the broker's Windows TCP fallback is out of scope. */
 export function brokerConnectTarget(agentDir: string): { kind: "unix"; path: string } {
   const intercomDir = join(agentDir, "intercom");
   const sock = join(intercomDir, "broker.sock");

@@ -1,166 +1,291 @@
 /**
- * Full-loop smoke (manual): isolated pi-intercom broker + pi-cc-bridge daemon +
- * a throwaway `claude -p` session. Verifies BOTH relay directions:
- *
- *   CC → pi : CC probe SendMessage → daemon inbox → routed to synthetic target
- *   pi → CC : synthetic target → daemon → CC probe socket → CC acknowledges
- *
- * Nothing touches the user's real pi sessions; the only real-filesystem writes
- * are the daemon's masquerade record in ~/.claude/sessions (removed on stop)
- * and the throwaway CC session's own record.
- *
- * Run: npx tsx scripts/e2e-smoke.ts
+ * Manual round-trip through an isolated broker and a dedicated Claude probe.
+ * Run with tsx scripts/e2e-smoke.ts. Never treats Claude stdout as delivery.
  */
-
-import { spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
 import { createRequire } from "node:module";
+import { BrokerClient, type BrokerEvent, type BrokerSessionInfo } from "../src/intercom/client.ts";
+import { BRIDGE_OWNER, ccSessionsDir } from "../src/cc/paths.ts";
+import { isPidAlive, procStart } from "../src/cc/registry.ts";
 
-const PI_INTERCOM_DIR = "/home/mauro/.pi/agent/npm/node_modules/pi-intercom";
-const PKG_DIR = new URL("..", import.meta.url).pathname;
+const PKG_DIR = fileURLToPath(new URL("..", import.meta.url));
 const requireFromPkg = createRequire(join(PKG_DIR, "package.json"));
-const tsx = requireFromPkg.resolve("tsx");
-const TOKEN_CC_TO_PI = "E2E-HELLO-CC-TO-PI";
-const TOKEN_PI_TO_CC = "E2E-ACK-P2C-77";
-const PEER = "pi-bridge";
-const TARGET = "e2e-target";
-const PROBE_NAME = `ccbridge-probe-${process.pid.toString(36)}`;
+type ReceivedMessage = Extract<BrokerEvent, { type: "message" }>;
 
-let failures = 0;
-function check(name: string, ok: boolean, detail?: string): void {
-  console.log(`${ok ? "PASS" : "FAIL"} ${name}${detail ? ` — ${detail}` : ""}`);
-  if (!ok) failures++;
+export function isProbeMessage(event: ReceivedMessage, peer: { id: string; name: string }, text: string): boolean {
+  return event.from.id === peer.id && event.from.name === peer.name &&
+    event.message.content.text === `Message from Claude Code session ${peer.name.slice("claude:".length)}:\n${text}`;
 }
 
-async function main(): Promise<void> {
+export function assertNoPrematureAck(messages: ReceivedMessage[], peer: { id: string; name: string }, ack: string): void {
+  if (messages.some(event => isProbeMessage(event, peer, ack))) throw new Error("premature ACK before pi to CC ping");
+}
+
+function intercomDir(): string {
+  if (process.env.PI_INTERCOM_DIR?.trim()) return process.env.PI_INTERCOM_DIR.trim();
+  try {
+    return dirname(requireFromPkg.resolve("pi-intercom/package.json"));
+  } catch {
+    return join(homedir(), ".pi", "agent", "npm", "node_modules", "pi-intercom");
+  }
+}
+
+function tsxLoader(intercom: string): string {
+  if (process.env.TSX_LOADER?.trim()) return process.env.TSX_LOADER.trim();
+  try {
+    return requireFromPkg.resolve("tsx");
+  } catch {
+    return join(intercom, "..", "tsx", "dist", "loader.mjs");
+  }
+}
+
+async function stop(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null || !child.pid) return;
+  const exited = new Promise<void>(resolveExit => child.once("exit", () => resolveExit()));
+  child.kill("SIGTERM");
+  await Promise.race([exited, sleep(3_000)]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await Promise.race([exited, sleep(3_000)]);
+  }
+  if (child.exitCode === null && child.signalCode === null) throw new Error(`child ${child.pid} did not exit`);
+}
+
+/** Remove only a stopped child's record whose identity still matches this run. */
+function cleanRecord(pid: number, name: string, bridge: boolean): void {
+  if (isPidAlive(pid)) throw new Error(`refusing record cleanup for live pid ${pid}`);
+  const dir = ccSessionsDir();
+  const path = join(dir, `${pid}.json`);
+  try {
+    const record = JSON.parse(readFileSync(path, "utf-8"));
+    if (record.pid !== pid || record.name !== name) throw new Error(`record identity changed for pid ${pid}`);
+    if (bridge && record.bridgeOwner !== BRIDGE_OWNER) throw new Error(`record ownership changed for pid ${pid}`);
+    rmSync(path);
+    for (const file of readdirSync(dir)) {
+      if (new RegExp(`^${pid}\\.[a-f0-9]{64}\\.key$`).test(file)) rmSync(join(dir, file));
+    }
+    if (typeof record.messagingSocketPath === "string" && record.messagingSocketPath.endsWith(`/${pid}.sock`)) {
+      rmSync(record.messagingSocketPath, { force: true });
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+}
+
+export async function main(): Promise<void> {
+  const nonce = randomUUID();
+  const peerName = `pi-bridge-probe-${nonce}`;
+  const targetName = `e2e-target-${nonce}`;
+  const probeName = `ccbridge-probe-${nonce}`;
+  const hello = `CC-TO-PI ${nonce}`;
+  const nativeHello = `NATIVE-CC-TO-PI ${nonce}`;
+  const holderName = `pi-${targetName}`;
+  const ping = `PI-TO-CC ${nonce}`;
+  const ack = `ACK ${nonce}`;
   const agentDir = mkdtempSync(join(tmpdir(), "ccbridge-e2e-"));
-  const stateDir = join(agentDir, "pi-cc-bridge");
-  mkdirSync(stateDir, { recursive: true });
-  writeFileSync(
-    join(stateDir, "config.json"),
-    JSON.stringify({ enabled: true, peerName: PEER, pollMs: 500, logLevel: "normal" }),
-  );
-
-  // 1. isolated broker
-  const broker = spawn(process.execPath, ["--import", tsx, join(PI_INTERCOM_DIR, "broker", "broker.ts")], {
-    env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, NODE_NO_WARNINGS: "1" },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  const brokerSock = join(agentDir, "intercom", "broker.sock");
-  for (let i = 0; i < 100 && !existsSync(brokerSock); i++) await sleep(100);
-  check("broker up", existsSync(brokerSock));
-
-  // 2. daemon
-  const daemon = spawn(process.execPath, ["--import", tsx, join(PKG_DIR, "src", "cli.ts")], {
-    env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, NODE_NO_WARNINGS: "1" },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  const daemonOut: string[] = [];
-  daemon.stderr?.on("data", d => daemonOut.push(d.toString()));
-  // wait for the daemon's masquerade record (written to the REAL sessions dir)
-  const realSessions = "/home/mauro/.claude/sessions";
-  let daemonPidFile = "";
-  for (let i = 0; i < 50; i++) {
-    try {
-      daemonPidFile = readFileSync(join(stateDir, "daemon.lock"), "utf-8").trim().split(" ")[0];
-      if (daemonPidFile && existsSync(join(realSessions, `${daemonPidFile}.json`))) break;
-    } catch {
-      /* not yet */
+  const children: ChildProcess[] = [];
+  const records: { child: ChildProcess; name: string; bridge: boolean }[] = [];
+  const diagnostics = new Map<ChildProcess, { role: string; stdout: Buffer; stderr: Buffer }>();
+  const holders = new Map<number, string>();
+  let daemon: ChildProcess | undefined;
+  let succeeded = false;
+  let target: BrokerClient | undefined;
+  let interrupted = false;
+  let childFailure: Error | undefined;
+  const interrupt = () => { interrupted = true; };
+  process.on("SIGINT", interrupt);
+  process.on("SIGTERM", interrupt);
+  const launch = (role: string, command: string, args: string[], env = process.env): ChildProcess => {
+    const child = spawn(command, args, { cwd: agentDir, env, stdio: ["pipe", "pipe", "pipe"] });
+    children.push(child);
+    const tails = { role, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) };
+    diagnostics.set(child, tails);
+    for (const stream of ["stdout", "stderr"] as const) {
+      child[stream]!.on("data", (chunk: Buffer) => {
+        tails[stream] = Buffer.concat([tails[stream], chunk]).subarray(-64 * 1024);
+      });
     }
-    await sleep(100);
-  }
-  check("daemon up + masquerade record", Boolean(daemonPidFile) && existsSync(join(realSessions, `${daemonPidFile}.json`)));
-
-  // 3. synthetic pi target on the isolated broker
-  const { BrokerClient } = await import("../src/intercom/client.ts");
-  const target = new BrokerClient(agentDir);
-  const fromCc = new Promise<string>(resolve => {
-    target.on("message", event => resolve(event.message.content.text));
-  });
-  await target.connectAndRegister(TARGET, {
-    name: TARGET,
-    cwd: process.cwd(),
-    model: "e2e",
-    pid: process.pid,
-    startedAt: Date.now(),
-    lastActivity: Date.now(),
-    acknowledgesReceipts: true,
-    livenessIntervalMs: 5_000,
-  });
-
-  // 4. CC probe session
-  const prompt =
-    `Send the message "${TOKEN_CC_TO_PI}" to the session named "${PEER}" using cross-session messaging. ` +
-    `The message text must start with a line "To: ${TARGET}". After sending, reply READY. ` +
-    `Afterwards, if you receive a message containing "${TOKEN_PI_TO_CC}", send back the text "ACK ${TOKEN_PI_TO_CC}" to "${PEER}" with the same "To: ${TARGET}" first line, then reply FINISHED.`;
-  const cc = spawn(
-    "claude",
-    ["-p", "--name", PROBE_NAME, "--model", "haiku", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--allowedTools", "ListAgents,SendMessage"],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
-  const ccOut: string[] = [];
-  cc.stdout?.on("data", d => ccOut.push(d.toString()));
-  cc.stdin?.write(JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n");
-  cc.stdin?.end();
-
-  // Phase A: CC → pi
-  let phaseA: string | null = null;
-  for (let i = 0; i < 120; i++) {
-    const winner = await Promise.race([fromCc, sleep(1_000).then(() => null)]);
-    if (winner && winner.includes(TOKEN_CC_TO_PI)) {
-      phaseA = winner;
-      break;
+    child.once("error", error => { childFailure = new Error(`${role} spawn failed: ${error.message}`); });
+    return child;
+  };
+  const findHolder = (): boolean => {
+    if (!daemon?.pid) return false;
+    for (const file of readdirSync(ccSessionsDir())) {
+      if (!file.endsWith(".json")) continue;
+      let record;
+      try { record = JSON.parse(readFileSync(join(ccSessionsDir(), file), "utf-8")); } catch { continue; }
+      if (record.name !== holderName || record.bridgeOwner !== BRIDGE_OWNER || record.kind !== "bridge") continue;
+      if (!Number.isSafeInteger(record.pid) || record.pid <= 0 || !isPidAlive(record.pid)) continue;
+      let args: string;
+      try {
+        args = execFileSync("/bin/ps", ["-p", String(record.pid), "-o", "args="], { encoding: "utf-8" });
+      } catch (error) {
+        if (!isPidAlive(record.pid)) continue;
+        throw error;
+      }
+      if (!args.includes(`"parentPid":${daemon.pid},`) || !args.includes(`"piSessionId":"${targetName}"`) || !args.includes(agentDir)) continue;
+      const start = procStart(record.pid);
+      if (!start) throw new Error("cannot verify owned holder identity");
+      holders.set(record.pid, start);
+      return true;
     }
-    if (winner) continue; // some other message; keep waiting
-  }
-  check("CC → pi relay", Boolean(phaseA), phaseA?.slice(0, 160));
-
-  // Phase B: pi → CC. The daemon should have registered claude:<name> for the probe.
-  let phaseB: string | null = null;
-  let phaseBSent = false;
-  for (let i = 0; i < 30; i++) {
-    const out = ccOut.join("");
-    if (out.includes("ACK") && out.includes(TOKEN_PI_TO_CC)) {
-      phaseB = out;
-      break;
+    return false;
+  };
+  const waitFor = async (label: string, predicate: () => boolean, timeout = 15_000) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      if (interrupted) throw new Error("smoke interrupted");
+      if (childFailure) throw childFailure;
+      const exited = children.find(child => child.exitCode !== null || child.signalCode !== null);
+      if (exited) throw new Error(`${diagnostics.get(exited)!.role} pid ${exited.pid} exited code=${exited.exitCode} signal=${exited.signalCode} while waiting for ${label}`);
+      if (predicate()) return;
+      await sleep(100);
     }
-    // send via target to the probe's synthetic peer once it exists
-    const rosterText = await new Promise<string>(resolve => {
-      const id = target.list();
-      const handler = (event: { requestId: string; sessions: { id: string; name?: string }[] }) => {
-        if (event.requestId !== id) return;
-        target.off("sessions", handler);
-        resolve(JSON.stringify(event.sessions.map(s => ({ id: s.id, name: s.name }))));
-      };
-      target.on("sessions", handler);
-      setTimeout(() => resolve("[]"), 2_000);
+    throw new Error(`timed out waiting for ${label}; ` + children.map(child =>
+      `${diagnostics.get(child)!.role} pid=${child.pid} code=${child.exitCode} signal=${child.signalCode}`,
+    ).join(", "));
+  };
+
+  try {
+    const intercom = intercomDir();
+    const tsx = tsxLoader(intercom);
+    const stateDir = join(agentDir, "pi-cc-bridge");
+    mkdirSync(stateDir, { mode: 0o700 });
+    writeFileSync(join(stateDir, "config.json"), JSON.stringify({
+      enabled: true, peerName, pollMs: 500, logLevel: "normal",
+      piSenderMode: "bypass", ccInbound: "hold-bypass", expose: [targetName], maxHolders: 1,
+    }), { mode: 0o600 });
+    const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, NODE_NO_WARNINGS: "1" };
+    launch("broker", process.execPath, ["--import", tsx, join(intercom, "broker", "broker.ts")], env);
+    await waitFor("isolated broker", () => existsSync(join(agentDir, "intercom", "broker.sock")));
+    daemon = launch("daemon", process.execPath, ["--import", tsx, join(PKG_DIR, "src", "cli.ts")], env);
+    records.push({ child: daemon, name: peerName, bridge: true });
+    await waitFor("dedicated funnel", () => {
+      try {
+        return JSON.parse(readFileSync(join(ccSessionsDir(), `${daemon!.pid}.json`), "utf-8")).name === peerName;
+      } catch { return false; }
     });
-    const probePeer = JSON.parse(rosterText).find((s: { id: string; name?: string }) => s.name === `claude:${PROBE_NAME}`);
-    if (probePeer && !phaseBSent) {
-      target.send(probePeer.id, { id: `e2e-${TOKEN_PI_TO_CC}`, timestamp: Date.now(), content: { text: `${TOKEN_PI_TO_CC}: please acknowledge` } });
-      phaseBSent = true;
-    }
-    await sleep(1_000);
-  }
-  check("pi → CC relay + CC ack", Boolean(phaseB));
 
-  // 5. cleanup + verify
-  const recordBefore = existsSync(join(realSessions, `${daemonPidFile}.json`));
-  daemon.kill("SIGTERM");
-  const broker2 = broker;
-  await sleep(1_500);
-  const recordAfter = existsSync(join(realSessions, `${daemonPidFile}.json`));
-  check("masquerade record cleaned up", recordBefore && !recordAfter);
-  broker2.kill("SIGTERM");
-  cc.kill("SIGKILL");
-  console.log(`\ndaemon log tail:\n${daemonOut.join("") || "(stderr empty)"}\n${readFileSync(join(stateDir, "daemon.log"), "utf-8").split("\n").slice(-8).join("\n")}`);
-  process.exit(failures ? 1 : 0);
+    target = new BrokerClient(agentDir);
+    const messages: ReceivedMessage[] = [];
+    const sessions = new Map<string, BrokerSessionInfo>();
+    target.on("message", (event: ReceivedMessage) => {
+      messages.push(event);
+      target!.receipt(event.message.id);
+    });
+    target.on("error", (event: { error: string }) => { childFailure = new Error(event.error); });
+    target.on("session_joined", (event: Extract<BrokerEvent, { type: "session_joined" }>) => sessions.set(event.session.id, event.session));
+    target.on("sessions", (event: Extract<BrokerEvent, { type: "sessions" }>) => {
+      for (const session of event.sessions) sessions.set(session.id, session);
+    });
+    await target.connectAndRegister(targetName, {
+      name: targetName, cwd: agentDir, model: "e2e", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(), status: "idle",
+      acknowledgesReceipts: true, livenessIntervalMs: 5_000,
+    });
+
+    const cc = launch("claude", "claude", [
+      "-p", "--name", probeName, "--model", "haiku", "--safe-mode", "--no-session-persistence",
+      "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", "--no-chrome",
+      "--settings", '{"crossSessionInbound":"accept"}',
+      "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+      "--tools", "ListAgents,SendMessage", "--allowedTools", "ListAgents,SendMessage",
+    ]);
+    records.push({ child: cc, name: probeName, bridge: false });
+    const prompt = `Use ListAgents to find the session named "${peerName}". Message only "${peerName}" and "${holderName}". ` +
+      `Use SendMessage to send exactly "To: ${targetName}\\n${hello}" to it (replace \\n with a newline). ` +
+      `Then use ListAgents to find "${holderName}" (retry discovery if not visible yet) and send exactly "${nativeHello}" to it. ` +
+      `When you receive a cross-session message from "${holderName}" whose text is exactly "${ping}", ` +
+      `use SendMessage to send exactly "${ack}" to "${holderName}". Do not send the ACK before receiving that message.`;
+    cc.stdin!.on("error", error => { childFailure = error; });
+    cc.stdin!.write(JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n");
+
+    target.list();
+    await waitFor("dedicated Claude registry record", () => {
+      try {
+        return JSON.parse(readFileSync(join(ccSessionsDir(), `${cc.pid}.json`), "utf-8")).name === probeName;
+      } catch { return false; }
+    }, 60_000);
+    const record = JSON.parse(readFileSync(join(ccSessionsDir(), `${cc.pid}.json`), "utf-8"));
+    const expected = { id: `cc-${record.sessionId}`, name: `claude:${probeName}` };
+    await waitFor("Claude peer on isolated broker", () => sessions.get(expected.id)?.name === expected.name);
+    await waitFor("owned native holder record", findHolder);
+    await waitFor("CC to pi nonce", () => messages.some(event => isProbeMessage(event, expected, hello)), 120_000);
+    console.log("PASS CC to pi: exact nonce received from dedicated Claude peer");
+    await waitFor("native CC to pi nonce", () => messages.some(event => isProbeMessage(event, expected, nativeHello)), 120_000);
+    console.log("PASS native holder discovery and CC to pi delivery");
+    assertNoPrematureAck(messages, expected, ack);
+    console.log("PASS no premature ACK before pi to CC ping");
+    const beforeReply = messages.length;
+    target.send(expected.id, { id: randomUUID(), timestamp: Date.now(), content: { text: ping } });
+    await waitFor("pi to CC acknowledgement", () => messages.slice(beforeReply).some(event => isProbeMessage(event, expected, ack)), 120_000);
+    console.log("PASS native pi to CC: exact ACK received through broker from dedicated Claude peer");
+    succeeded = true;
+  } finally {
+    const errors: unknown[] = [];
+    try { findHolder(); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
+    }
+    target?.close();
+    for (const child of [...children].reverse()) {
+      try { await stop(child); } catch (error) { errors.push(error); }
+    }
+    for (const [pid, start] of holders) {
+      try {
+        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+          if (!isPidAlive(pid)) break;
+          if (procStart(pid) !== start) throw new Error(`holder pid ${pid} identity changed`);
+          process.kill(pid, signal);
+          const deadline = Date.now() + 3_000;
+          while (isPidAlive(pid) && Date.now() < deadline) await sleep(100);
+        }
+        cleanRecord(pid, holderName, true);
+        if (existsSync(join(ccSessionsDir(), `${pid}.json`))) throw new Error(`holder record ${pid} remains`);
+      } catch (error) { errors.push(error); }
+    }
+    for (const record of records) {
+      if (!record.child.pid) continue;
+      try { cleanRecord(record.child.pid, record.name, record.bridge); } catch (error) { errors.push(error); }
+    }
+    try {
+      for (const file of readdirSync(ccSessionsDir())) {
+        if (!file.endsWith(".json")) continue;
+        let record;
+        try { record = JSON.parse(readFileSync(join(ccSessionsDir(), file), "utf-8")); } catch { continue; }
+        if (record.name === holderName && record.bridgeOwner === BRIDGE_OWNER) throw new Error(`owned holder record remains: ${file}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
+    }
+    for (const [child, tails] of diagnostics) {
+      try {
+        for (const stream of ["stdout", "stderr"] as const) {
+          writeFileSync(join(agentDir, `${tails.role}.${stream}.tail`), tails[stream], { mode: 0o600 });
+        }
+        writeFileSync(join(agentDir, `${tails.role}.exit.json`), JSON.stringify({ pid: child.pid, code: child.exitCode, signal: child.signalCode }), { mode: 0o600 });
+      } catch (error) { errors.push(error); }
+    }
+    process.off("SIGINT", interrupt);
+    process.off("SIGTERM", interrupt);
+    if (errors.length) throw new AggregateError(errors, `cleanup incomplete; private diagnostics retained at ${agentDir}`);
+    if (succeeded) {
+      rmSync(agentDir, { recursive: true, force: true });
+      console.log("PASS owned children and native holder records removed");
+    } else {
+      console.error(`Private smoke diagnostics retained at ${agentDir}`);
+    }
+  }
 }
 
-main().catch(error => {
-  console.error("smoke crashed:", error);
-  process.exit(1);
-});
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => {
+    console.error("smoke failed:", (error as Error).message);
+    process.exitCode = 1;
+  });
+}
