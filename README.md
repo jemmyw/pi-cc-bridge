@@ -1,5 +1,7 @@
 # pi-cc-bridge
 
+Optional: [Claude external-job writer provider](docs/claude-jobs.md), loaded separately. Normal bridge sessions and stock pi-subagents stay unchanged.
+
 ![version](https://img.shields.io/badge/version-0.3.0-blue)
 ![license](https://img.shields.io/badge/license-MIT-green)
 ![node](https://img.shields.io/badge/node-%E2%89%A520.6-brightgreen)

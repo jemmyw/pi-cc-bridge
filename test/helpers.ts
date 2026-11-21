@@ -27,6 +27,19 @@ export function piIntercomDir(): string | undefined {
   }
 }
 
+export function piSubagentsDir(): string | undefined {
+  const explicit = process.env.PI_SUBAGENTS_DIR?.trim();
+  if (explicit) return existsSync(join(explicit, "package.json")) ? explicit : undefined;
+  const agentDir = process.env.PI_CODING_AGENT_DIR?.trim() || join(homedir(), ".pi", "agent");
+  for (const root of [import.meta.url, join(agentDir, "npm", "package.json")]) {
+    try {
+      const entry = createRequire(root).resolve("pi-subagents/external-job-provider");
+      return dirname(dirname(entry));
+    } catch { /* Optional opt-in integration package. */ }
+  }
+  return undefined;
+}
+
 export const BROKER_ENTRY = join(piIntercomDir() ?? "", "broker", "broker.ts");
 export const SKIP = !existsSync(BROKER_ENTRY);
 export const SKIP_REASON: string | boolean = SKIP
