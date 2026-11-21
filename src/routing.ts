@@ -94,6 +94,13 @@ export function allocateHolderAlias(params: {
   return `${base}#${n}`;
 }
 
+type FunnelRoute = { text: string } & (
+  | { reason: "to-hit" | "route-to-hit" | "single"; target: string }
+  | { reason: "to-miss"; target: undefined; requested: string }
+  | { reason: "several"; target: undefined; count: number }
+  | { reason: "zero"; target: undefined }
+);
+
 /**
  * Funnel routing (P1-8): explicit `To:` header (case-sensitive, single line)
  * resolves or HOLDS — an explicit address never reroutes. Then `routeTo`, then
@@ -104,18 +111,20 @@ export function routeFunnel(
   roster: Iterable<RosterEntryLike>,
   routeTo: string | undefined,
   ccPrefix = "cc-",
-): { target?: string; text: string } {
+): FunnelRoute {
   const sessions = [...roster];
   const parsed = parseToHeader(text);
   if (parsed) {
     const hit = matchTarget(parsed.target, sessions);
-    if (!hit) return { target: undefined, text };
-    return { target: hit, text: parsed.rest };
+    if (!hit) return { reason: "to-miss", target: undefined, requested: parsed.target, text };
+    return { reason: "to-hit", target: hit, text: parsed.rest };
   }
   if (routeTo) {
     const hit = matchTarget(routeTo, sessions);
-    if (hit) return { target: hit, text };
+    if (hit) return { reason: "route-to-hit", target: hit, text };
   }
   const others = sessions.filter(s => !s.id.startsWith(ccPrefix));
-  return { target: others.length === 1 ? others[0].id : undefined, text };
+  if (others.length === 1) return { reason: "single", target: others[0].id, text };
+  if (others.length > 1) return { reason: "several", target: undefined, count: others.length, text };
+  return { reason: "zero", target: undefined, text };
 }

@@ -136,16 +136,15 @@ test("routeFunnel: explicit addresses hold, never reroute (critic P1-8 table)", 
     { id: "cc-1", name: "claude:test-cc" },
   ];
   // To: resolves (bare or pi- spelling), strips the header, explicit-unknown holds
-  assert.deepEqual(routeFunnel("To: worker\ndo the thing", roster, undefined), { target: "bbb", text: "do the thing" });
-  assert.deepEqual(routeFunnel("To: pi-planner\nhi", roster, undefined), { target: "aaa", text: "hi" });
-  assert.deepEqual(routeFunnel("To: nobody\nhi", roster, undefined), { target: undefined, text: "To: nobody\nhi" });
-  // routeTo only applies without an explicit header
-  assert.deepEqual(routeFunnel("plain", roster, "planner"), { target: "aaa", text: "plain" });
-  assert.deepEqual(routeFunnel("To: nobody\nhi", roster, "planner"), { target: undefined, text: "To: nobody\nhi" });
-  // single other session rule; cc-* entries never qualify
-  assert.deepEqual(routeFunnel("plain", [{ id: "cc-1" }, { id: "only", name: "solo" }], undefined), { target: "only", text: "plain" });
-  assert.deepEqual(routeFunnel("plain", [{ id: "cc-1" }], undefined), { target: undefined, text: "plain" });
-  assert.deepEqual(routeFunnel("plain", roster, undefined), { target: undefined, text: "plain" }); // ambiguous
+  assert.deepEqual(routeFunnel("To: worker\ndo the thing", roster, undefined), { reason: "to-hit", target: "bbb", text: "do the thing" });
+  assert.deepEqual(routeFunnel("To: pi-planner\nhi", roster, "worker"), { reason: "to-hit", target: "aaa", text: "hi" });
+  const miss = { reason: "to-miss", target: undefined, requested: "nobody", text: "To: nobody\nhi" };
+  assert.deepEqual(routeFunnel(miss.text, roster, "planner"), miss);
+  assert.deepEqual(routeFunnel(miss.text, roster.slice(0, 1), undefined), miss);
+  assert.deepEqual(routeFunnel("plain", roster, "planner"), { reason: "route-to-hit", target: "aaa", text: "plain" });
+  assert.deepEqual(routeFunnel("plain", roster.slice(1), "missing"), { reason: "single", target: "bbb", text: "plain" });
+  assert.deepEqual(routeFunnel("plain", roster, undefined), { reason: "several", target: undefined, count: 2, text: "plain" });
+  assert.deepEqual(routeFunnel("plain", roster.slice(-1), undefined), { reason: "zero", target: undefined, text: "plain" });
 });
 
 test("derivedCcName: CC's derived-name convention (basename + 2 hex), stable", () => {

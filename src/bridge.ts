@@ -62,6 +62,9 @@ const HOLDER_LINE = 10; // \n
 const MAX_RELAY_BYTES = 900 * 1024; // below CC's ~1M-char refusal (P1-7)
 const SPAWN_COOLDOWN_MS = 10_000;
 const MAX_CRASHES = 5;
+const HOLD_FAILED = "(hold failed)";
+const isLiveCcRecord = (record: CcRecord) => record.pid !== process.pid && record.kind !== "bridge" &&
+  isTargetableRecord(record) && isPidAlive(record.pid);
 
 export class Bridge {
   private peers = new Map<string, Peer>(); // key: CC sessionId
@@ -204,10 +207,7 @@ export class Bridge {
     const usedNames = new Set<string>([this.config.peerName, ...[...this.holders.values()].map(h => `pi-${h.alias}`)]);
 
     for (const { record } of records) {
-      if (!isTargetableRecord(record)) continue;
-      if (record.pid === process.pid) continue; // our own masquerade record
-      if (record.kind === "bridge") continue; // holder records are not CC sessions
-      if (!isPidAlive(record.pid)) continue;
+      if (!isLiveCcRecord(record)) continue;
       if (this.peers.size >= this.config.maxPeers && !this.peers.has(record.sessionId)) {
         this.logOnce("maxPeers", `maxPeers ${this.config.maxPeers} reached; not mirroring ${record.name ?? record.sessionId}`);
         continue;
@@ -683,6 +683,11 @@ export class Bridge {
     }
   }
 
+  private reachablePiList(): string | undefined {
+    const names = [...this.holders.values()].map(h => `- pi-${h.alias}`);
+    return names.length ? `Reachable Pi sessions:\n${names.join("\n")}` : undefined;
+  }
+
   /** CC → pi via a holder entry. Trust policy + routing live HERE, not in the child. */
   private relayCcToPi(holder: HolderState, msg: Record<string, unknown>): void {
     const fromSocketRaw = typeof msg.fromSocket === "string" ? msg.fromSocket : undefined;
@@ -717,10 +722,9 @@ export class Bridge {
     }
 
     if (text.trim() === "/list") {
-      const names = [...this.holders.values()].map(h => `- pi-${h.alias}`);
       void this.sendHolderReply(holder, {
         toSocket: fromSocket,
-        text: names.length ? `Reachable pi sessions:\n${names.join("\n")}` : "No other pi sessions are currently connected to intercom.",
+        text: this.reachablePiList() ?? "No other pi sessions are currently connected to intercom.",
         msgId: `list-${msgId}`.slice(0, 128),
       });
       return;
@@ -820,7 +824,7 @@ export class Bridge {
     return false;
   }
 
-  private async noticeToCc(socketPath: string, alias: string, text: string, msgId?: string): Promise<void> {
+  private async noticeToCc(socketPath: string, alias: string | undefined, text: string, msgId?: string): Promise<void> {
     if (!this.isAllowedReplySocket(socketPath)) {
       this.log(`refused reply to unvalidated socket ${socketPath}`);
       return;
@@ -834,7 +838,7 @@ export class Bridge {
         text,
         msgId: msgId ?? `notice-${randomUUID()}`.slice(0, 128),
       });
-      this.log(`notice sent to ${socketPath} (about pi-${alias})`);
+      this.log(`notice sent to ${socketPath}${alias === undefined ? "" : ` (about pi-${alias})`}`);
     } catch (error) {
       this.log(`notice to ${socketPath} failed: ${(error as Error).message}`);
     }
@@ -849,13 +853,10 @@ export class Bridge {
       return file;
     } catch (error) {
       this.log(`hold() failed: ${(error as Error).message}`);
-      return "(hold failed)";
+      return HOLD_FAILED;
     }
   }
 
-  // ── Funnel (masquerade) inbox ───────────────────────────────────────────────
-
-  /** CC → pi (funnel): a frame arrived on our masqueraded inbox. */
   private async onCcFrame(frame: ParsedInbound): Promise<void> {
     if (frame.kind !== "user") {
       if (frame.kind === "action") this.log(`cc action frame: ${frame.action} (ignored)`);
@@ -866,29 +867,46 @@ export class Bridge {
     const fromName = frame.meta.fromName ?? fromSocket ?? "claude-session";
 
     if (frame.text.trim() === "/list") {
-      const names = [...this.holders.values()].map(h => `- pi-${h.alias}`);
+      const list = this.reachablePiList();
       try {
         await postToCcInbox({
           socketPath: (fromSocket ?? "").startsWith("uds:") ? fromSocket!.slice(4) : fromSocket ?? "",
           senderSocketPath: ownSocketPath(this.paths),
           senderName: this.config.peerName,
           senderMode: this.config.piSenderMode,
-          text: names.length
-            ? `Reachable pi sessions:\n${names.join("\n")}\n(You can SendMessage these directly, or use the funnel with a leading "To: <name>" line.)`
+          text: list
+            ? `${list}\n(You can SendMessage these directly, or use the funnel with a leading "To: <name>" line.)`
             : "No other pi sessions are currently connected to intercom.",
           msgId: `list-${frame.line.msg_id}`.slice(0, 128),
         });
-        this.log(`list query from ${fromName} answered with ${names.length} sessions`);
+        this.log(`list query from ${fromName} answered with ${this.holders.size} sessions`);
       } catch (error) {
         this.log(`list reply to ${fromName} failed: ${(error as Error).message}`);
       }
       return;
     }
 
-    const { target, text } = routeFunnel(frame.text, [...this.roster.values()], this.config.routeTo);
+    const route = routeFunnel(frame.text, this.roster.values(), this.config.routeTo);
+    const { target, text } = route;
     if (!target) {
-      const file = this.hold(frame.meta ? "funnel-unrouted" : "funnel-unrouted", { fromName, text, msgId: frame.line.msg_id });
+      const file = this.hold("funnel-unrouted", { fromName, text, msgId: frame.line.msg_id });
       this.log(`cc message from ${fromName} held (no route): ${file}`);
+      const socket = fromSocket?.startsWith("uds:") ? fromSocket.slice(4) : fromSocket;
+      const registered = socket && listRecordsSync(this.paths).some(({ record }) => record.messagingSocketPath === socket && isLiveCcRecord(record));
+      if (!socket || (registered && !existsSync(socket))) {
+        this.log(`skipped funnel notice to ${fromName}: sender socket absent`);
+        return;
+      }
+      if (!registered) {
+        this.log(`refused funnel notice to ${fromName}: no live CC record for ${socket}`);
+        return;
+      }
+      const reason = route.reason === "to-miss" ? `To: target <${route.requested}> matches no Pi session`
+        : route.reason === "several" ? `no To: line and ${route.count} Pi sessions connected` : "no Pi sessions connected";
+      const saved = file === HOLD_FAILED ? "Could not save the message in held/." : "Message saved in held/.";
+      const list = this.reachablePiList();
+      await this.noticeToCc(socket, undefined, `Not delivered: ${reason}. ${saved}\n${list ? `${list}\n` : ""}` +
+        "Resend directly to pi-<alias> or put To: <alias> on the first line.");
       return;
     }
     const peer = this.findPeerBySender(fromSocket);

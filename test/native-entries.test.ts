@@ -210,6 +210,63 @@ test("native entries: holder child exposes pi sessions to CC; both relays work",
   assert.ok(cleaned, "holder record, socket, and process must be cleaned up");
 });
 
+test("funnel: unaddressed message with two Pi sessions is held and only the sender is notified", { skip: SKIP_REASON }, async t => {
+  const fixture = await setupFixture();
+  const sessions = ["planner", "worker"].map(name => ({ name, client: new BrokerClient(fixture.agentDir) }));
+  const relayed: { to: string; id: string }[] = [];
+  let daemon: ReturnType<typeof startDaemon> | undefined;
+  t.after(async () => {
+    for (const { client } of sessions) client.close();
+    if (daemon) {
+      daemon.kill("SIGTERM");
+      await waitFor(() => daemon!.exitCode !== null || daemon!.signalCode !== null);
+    }
+    fixture.cleanup();
+  });
+  for (const { name, client } of sessions) {
+    client.on("message", event => {
+      relayed.push({ to: name, id: event.message.id });
+      client.receipt(event.message.id);
+    });
+    await client.connectAndRegister(`${name}-id`, {
+      name, cwd: process.cwd(), model: "test", pid: process.pid,
+      startedAt: Date.now(), lastActivity: Date.now(), status: "idle", livenessIntervalMs: 5000,
+    });
+  }
+  daemon = startDaemon(fixture.agentDir);
+  assert.ok(await waitFor(() => sessions.every(({ name }) => readHolderPidFor(fixture.agentDir, `pi-${name}`))));
+  const { messagingSocketPath: inbox } = JSON.parse(readFileSync(join(fixture.sessionsDir, `${daemon.pid}.json`), "utf-8"));
+  const text = "Please review the patch";
+  const msgId = "unaddressed-1";
+  const line = JSON.parse(buildOutboundLine({ senderSocketPath: fixture.mySocketPath, senderName: "test-cc", text, msgId }));
+  delete line.from; // Exercise the uds: sender address from the envelope.
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.createConnection(inbox);
+    socket.once("connect", () => socket.end(`${JSON.stringify(line)}\n`));
+    socket.once("error", reject);
+    socket.once("close", () => resolve());
+  });
+
+  assert.ok(await waitFor(() => fixture.myLines.length > 0), "sender receives the notice");
+  await sleep(350);
+  assert.equal(fixture.myLines.length, 1);
+  const notice = parseInboundLine(fixture.myLines[0]);
+  assert.ok(notice.kind === "user");
+  assert.equal(notice.line.from, inbox);
+  const [reason, heading, ...entries] = notice.text.split("\n");
+  assert.equal(reason, "Not delivered: no To: line and 2 Pi sessions connected. Message saved in held/.");
+  assert.equal(heading, "Reachable Pi sessions:");
+  assert.equal(entries.pop(), "Resend directly to pi-<alias> or put To: <alias> on the first line.");
+  assert.deepEqual(entries.sort(), ["- pi-planner", "- pi-worker"]);
+  const heldDir = join(fixture.agentDir, "pi-cc-bridge", "held");
+  const files = readdirSync(heldDir);
+  assert.equal(files.length, 1);
+  const { at, ...held } = JSON.parse(readFileSync(join(heldDir, files[0]), "utf-8"));
+  assert.equal(typeof at, "number");
+  assert.deepEqual(held, { reason: "funnel-unrouted", fromName: "test-cc", text, msgId });
+  assert.deepEqual(relayed, [], "neither Pi session receives a relay");
+});
+
 function readDaemonPid(agentDir: string): string {
   try {
     return readFileSync(join(agentDir, "pi-cc-bridge", "daemon.lock"), "utf-8").trim().split(" ")[0];
