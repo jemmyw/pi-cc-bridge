@@ -31,8 +31,9 @@ Task-3 complete: retry logic added to src/api/client.ts.
 
 ## Discovering pi sessions
 
-Run `/list-agents` — `pi-<alias>` entries are pi sessions. Sending `list` to
-`pi-bridge` (or any `pi-*` entry) also returns the connected aliases.
+Send `/list` to the configured bridge peer (`pi-bridge` by default), then
+message the returned `pi-<alias>` entries directly. You can also find those
+entries in `/list-agents`.
 
 ## Etiquette and limits
 

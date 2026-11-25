@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { CcRecord, isTargetableRecord, ownSocketPath, ccSocketDir, CcPathsOptions, ensurePrivateDir, ensureSessionsDir } from "./cc/paths.ts";
 import { gcOwnStaleRecords, listRecordsSync, procStart, selfCheckProcStart, pidDomainFor, writeOwnRecord, removeOwnRecord, isPidAlive } from "./cc/registry.ts";
 import { startCcInbox, CcInboxServer } from "./cc/inbox.ts";
-import { postToCcInbox } from "./cc/poster.ts";
+import { CcDiscovery } from "./cc/discovery.ts";
 import { ParsedInbound } from "./cc/protocol.ts";
 import { BrokerClient, IntercomMessage, BrokerSessionInfo } from "./intercom/client.ts";
 import { BridgeConfig, bridgeStateDir } from "./config.ts";
@@ -88,6 +88,7 @@ export class Bridge {
     }
   };
   private readonly asks = new AskReplies();
+  private readonly discovery: CcDiscovery;
   private readonly piLimiter: RateLimiter;
   private readonly ccLimiter: RateLimiter;
   private heldDir: string;
@@ -100,6 +101,7 @@ export class Bridge {
     this.heldDir = join(bridgeStateDir(config.agentDir), "held");
     mkdirSync(this.heldDir, { recursive: true, mode: 0o700 });
     this.ipcPath = join(bridgeStateDir(config.agentDir), "holders-ipc.sock");
+    this.discovery = new CcDiscovery(config.peerName);
     this.piLimiter = new RateLimiter(config.relayPerMin, config.relayBurst);
     this.ccLimiter = new RateLimiter(config.relayPerMin, config.relayBurst);
   }
@@ -655,7 +657,7 @@ export class Bridge {
         token = this.asks.add(this.askRoute(peer, sender.id), event.message.id);
         text = `${askInstructions(token)}\n${text}`;
       }
-      await postToCcInbox({
+      await this.discovery.post(peer.cc.sessionId, {
         socketPath: peer.cc.messagingSocketPath,
         senderSocketPath: native ? holder!.socketPath! : ownSocketPath(this.paths),
         senderName: native ? `pi-${holder!.alias}` : this.config.peerName,
@@ -741,12 +743,12 @@ export class Bridge {
       }
       const targetHolder = this.holders.get(target);
       if (targetHolder) {
-        this.deliverToHolder(targetHolder, fromName, fromSocket, parsed.rest, msgId, peerNameFor(fromName, fromSocket, this.peers));
+        this.deliverToHolder(targetHolder, fromName, fromSocket, parsed.rest, msgId);
         return;
       }
     }
 
-    this.deliverToHolder(holder, fromName, fromSocket, text, msgId, peerNameFor(fromName, fromSocket, this.peers));
+    this.deliverToHolder(holder, fromName, fromSocket, text, msgId);
   }
 
   private deliverToHolder(
@@ -755,7 +757,6 @@ export class Bridge {
     fromSocket: string | undefined,
     text: string,
     msgId: string,
-    ccName: string,
   ): void {
     const peer = fromSocket ? [...this.peers.values()].find(p => p.cc.messagingSocketPath === fromSocket) : undefined;
     if (!peer) {
@@ -764,7 +765,7 @@ export class Bridge {
       setTimeout(() => {
         const retryPeer = fromSocket ? [...this.peers.values()].find(p => p.cc.messagingSocketPath === fromSocket) : undefined;
         if (retryPeer) {
-          this.deliverToHolder(holder, fromName, fromSocket, text, msgId, ccNameFor(retryPeer));
+          this.deliverToHolder(holder, fromName, fromSocket, text, msgId);
         } else {
           const file = this.hold("unknown-sender", { fromName, fromSocket, text, msgId });
           this.log(`held: sender ${fromName ?? fromSocket} matches no CC session (${file})`);
@@ -784,7 +785,7 @@ export class Bridge {
     this.pending.delete(messageId);
     this.hold("delivery_failed", { ...p, reason });
     if (p.fromSocket) {
-      void this.noticeToCc(p.fromSocket, p.alias, `Not delivered to pi-${p.alias}: ${reason}. Queued at held/.`);
+      void this.noticeToCc(p.fromSocket, p.alias, `Not delivered to pi-${p.alias}: ${reason}. Queued at held/.`, undefined, true);
     }
   }
 
@@ -795,7 +796,7 @@ export class Bridge {
       if (now - p.at < 60_000) continue;
       this.pending.delete(msgId);
       if (p.fromSocket) {
-        void this.noticeToCc(p.fromSocket, p.alias, `pi-${p.alias} has not picked up your message after 60s (busy or non-interactive); queued at held/.`);
+        void this.noticeToCc(p.fromSocket, p.alias, `pi-${p.alias} has not picked up your message after 60s (busy or non-interactive); queued at held/.`, undefined, true);
       }
     }
   }
@@ -824,20 +825,25 @@ export class Bridge {
     return false;
   }
 
-  private async noticeToCc(socketPath: string, alias: string | undefined, text: string, msgId?: string): Promise<void> {
+  private ccSessionIdForSocket(socketPath: string): string | undefined {
+    return this.findPeerBySender(socketPath)?.cc.sessionId ?? listRecordsSync(this.paths)
+      .find(({ record }) => record.messagingSocketPath === socketPath && isLiveCcRecord(record))?.record.sessionId;
+  }
+
+  private async noticeToCc(socketPath: string, alias: string | undefined, text: string, msgId?: string, alwaysHint = false): Promise<void> {
     if (!this.isAllowedReplySocket(socketPath)) {
       this.log(`refused reply to unvalidated socket ${socketPath}`);
       return;
     }
     try {
-      await postToCcInbox({
+      await this.discovery.post(this.ccSessionIdForSocket(socketPath), {
         socketPath,
         senderSocketPath: ownSocketPath(this.paths),
         senderName: this.config.peerName,
         senderMode: this.config.piSenderMode,
         text,
         msgId: msgId ?? `notice-${randomUUID()}`.slice(0, 128),
-      });
+      }, alwaysHint);
       this.log(`notice sent to ${socketPath}${alias === undefined ? "" : ` (about pi-${alias})`}`);
     } catch (error) {
       this.log(`notice to ${socketPath} failed: ${(error as Error).message}`);
@@ -869,8 +875,9 @@ export class Bridge {
     if (frame.text.trim() === "/list") {
       const list = this.reachablePiList();
       try {
-        await postToCcInbox({
-          socketPath: (fromSocket ?? "").startsWith("uds:") ? fromSocket!.slice(4) : fromSocket ?? "",
+        const socketPath = fromSocket?.startsWith("uds:") ? fromSocket.slice(4) : fromSocket ?? "";
+        await this.discovery.post(this.ccSessionIdForSocket(socketPath), {
+          socketPath,
           senderSocketPath: ownSocketPath(this.paths),
           senderName: this.config.peerName,
           senderMode: this.config.piSenderMode,
@@ -906,7 +913,7 @@ export class Bridge {
       const saved = file === HOLD_FAILED ? "Could not save the message in held/." : "Message saved in held/.";
       const list = this.reachablePiList();
       await this.noticeToCc(socket, undefined, `Not delivered: ${reason}. ${saved}\n${list ? `${list}\n` : ""}` +
-        "Resend directly to pi-<alias> or put To: <alias> on the first line.");
+        "Resend directly to pi-<alias> or put To: <alias> on the first line.", undefined, true);
       return;
     }
     const peer = this.findPeerBySender(fromSocket);
@@ -977,15 +984,6 @@ export class Bridge {
       join(process.env.HOME ?? "", ".pi", "agent")
     );
   }
-}
-
-function peerNameFor(fromName: string | undefined, fromSocket: string | undefined, peers: Map<string, Peer>): string {
-  if (!fromSocket) return fromName ?? "unknown";
-  const bare = fromSocket.startsWith("uds:") ? fromSocket.slice(4) : fromSocket;
-  for (const peer of peers.values()) {
-    if (peer.cc.messagingSocketPath === bare) return ccNameFor(peer);
-  }
-  return fromName ?? "unknown";
 }
 
 /** Human label for a pi session; runtime fallback aliases read as strangers. */

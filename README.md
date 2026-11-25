@@ -33,8 +33,10 @@ pi sessions ⇄ pi-intercom broker ⇄ [pi-cc-bridge daemon] ⇄ CC inbox socket
   `claude:<name>` peer. Message it with the ordinary intercom tool.
 - **From Claude Code**: every live pi session shows up in `/list-agents` as a
   `pi-<alias>` session (status mirrored). `SendMessage` it directly — or use
-  the `pi-bridge` funnel with a `To: <pi-alias>` first line (or send `list`
-  to discover pi sessions).
+  the bridge funnel with a `To: <pi-alias>` first line. Send `/list` to the
+  configured bridge peer (`pi-bridge` by default), then message `pi-<alias>`
+  directly. The first bridge reply or relay to each Claude session per daemon run
+  includes this hint, as do routing failure notices.
 
 Both wire directions were verified live against Claude Code 2.1.296 and
 pi-intercom 0.17.0; see `docs/DESIGN.md` for the captured protocol and

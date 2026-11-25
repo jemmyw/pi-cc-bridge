@@ -27,6 +27,8 @@ import { buildOutboundLine, parseInboundLine } from "../src/cc/protocol.ts";
  */
 
 const PKG_DIR = new URL("..", import.meta.url).pathname;
+const BRIDGE_NAME = "test-bridge";
+const DISCOVERY_HINT = '[pi-cc-bridge] Send /list to the bridge peer "test-bridge" to find reachable Pi sessions, then message pi-<alias> directly.';
 
 interface Fixture {
   agentDir: string;
@@ -91,7 +93,7 @@ async function setupFixture(): Promise<Fixture> {
   mkdirSync(stateDir, { recursive: true });
   writeFileSync(
     join(stateDir, "config.json"),
-    JSON.stringify({ enabled: true, pollMs: 250, expose: ["*"], maxHolders: 8, ccSessionsDir: sessionsDir }),
+    JSON.stringify({ enabled: true, peerName: BRIDGE_NAME, pollMs: 250, expose: ["*"], maxHolders: 8, ccSessionsDir: sessionsDir }),
   );
   // socketDir override goes through the same key the config loader reads:
   const cfg = JSON.parse(readFileSync(join(stateDir, "config.json"), "utf-8"));
@@ -195,13 +197,19 @@ test("native entries: holder child exposes pi sessions to CC; both relays work",
   assert.match(got.text, /Message from Claude Code session test-cc:\nNATIVE-CC-TO-PI-1/);
 
   // 4. pi → CC relay: planner sends to the synthetic peer by name.
-  planner.send("claude:test-cc", { id: "native-2", timestamp: Date.now(), content: { text: "NATIVE-PI-TO-CC-1" } });
-  const ccGot = await waitFor(() => fixture.myLines.some(l => l.includes("NATIVE-PI-TO-CC-1")), 10_000);
-  assert.ok(ccGot, "fake CC socket must receive the pi message");
-  const inbound = JSON.parse(fixture.myLines.find(l => l.includes("NATIVE-PI-TO-CC-1"))!);
-  assert.equal(inbound.type, "user");
-  assert.match(inbound.message.content, /from-name="pi-planner"/, "sender identity must be the pi session's holder entry");
-  assert.equal(inbound.from, holderSocket, "sender socket must be the holder's socket so replies route back");
+  const texts = ["NATIVE-PI-TO-CC-1\nWith whitespace. ", "NATIVE-PI-TO-CC-2"];
+  for (const [i, text] of texts.entries()) {
+    planner.send("claude:test-cc", { id: `pi-${i}`, timestamp: Date.now(), content: { text } });
+  }
+  assert.ok(await waitFor(() => fixture.myLines.length >= 2), "fake CC socket must receive both pi messages");
+  for (const [i, text] of texts.entries()) {
+    const inbound = parseInboundLine(fixture.myLines[i]);
+    assert.ok(inbound.kind === "user");
+    assert.equal(inbound.line.msg_id, `pi-${i}`);
+    assert.equal(inbound.meta.fromName, "pi-planner", "sender identity must be the pi session's holder entry");
+    assert.equal(inbound.line.from, holderSocket, "sender socket must be the holder's socket so replies route back");
+    assert.equal(inbound.text, i === 0 ? `${DISCOVERY_HINT}\n\n${text}` : text);
+  }
 
   // 5. cleanup: daemon SIGTERM removes holder record + socket.
   const holderPid = holderRecordJson.pid;
@@ -236,24 +244,35 @@ test("funnel: unaddressed message with two Pi sessions is held and only the send
   daemon = startDaemon(fixture.agentDir);
   assert.ok(await waitFor(() => sessions.every(({ name }) => readHolderPidFor(fixture.agentDir, `pi-${name}`))));
   const { messagingSocketPath: inbox } = JSON.parse(readFileSync(join(fixture.sessionsDir, `${daemon.pid}.json`), "utf-8"));
+  const post = (text: string, msgId: string) => writeCcLine(inbox, buildOutboundLine({
+    senderSocketPath: fixture.mySocketPath, senderName: "test-cc", text, msgId,
+  }));
+  for (const n of [1, 2]) {
+    await post("/list", `query-${n}`);
+    assert.ok(await waitFor(() => fixture.myLines.length >= n));
+    const list = parseInboundLine(fixture.myLines[n - 1]);
+    assert.ok(list.kind === "user");
+    assert.equal(list.line.msg_id, `list-query-${n}`);
+    assert.ok(list.text.startsWith(n === 1 ? `${DISCOVERY_HINT}\n\nReachable Pi sessions:\n` : "Reachable Pi sessions:\n"));
+    assert.match(list.text, /pi-planner/);
+  }
+
   const text = "Please review the patch";
   const msgId = "unaddressed-1";
   const line = JSON.parse(buildOutboundLine({ senderSocketPath: fixture.mySocketPath, senderName: "test-cc", text, msgId }));
   delete line.from; // Exercise the uds: sender address from the envelope.
-  await new Promise<void>((resolve, reject) => {
-    const socket = net.createConnection(inbox);
-    socket.once("connect", () => socket.end(`${JSON.stringify(line)}\n`));
-    socket.once("error", reject);
-    socket.once("close", () => resolve());
-  });
+  await writeCcLine(inbox, JSON.stringify(line));
 
-  assert.ok(await waitFor(() => fixture.myLines.length > 0), "sender receives the notice");
+  assert.ok(await waitFor(() => fixture.myLines.length >= 3), "sender receives the notice");
   await sleep(350);
-  assert.equal(fixture.myLines.length, 1);
-  const notice = parseInboundLine(fixture.myLines[0]);
+  assert.equal(fixture.myLines.length, 3);
+  const notice = parseInboundLine(fixture.myLines[2]);
   assert.ok(notice.kind === "user");
   assert.equal(notice.line.from, inbox);
-  const [reason, heading, ...entries] = notice.text.split("\n");
+  assert.equal(notice.meta.fromName, BRIDGE_NAME);
+  const [hint, separator, reason, heading, ...entries] = notice.text.split("\n");
+  assert.equal(hint, DISCOVERY_HINT);
+  assert.equal(separator, "");
   assert.equal(reason, "Not delivered: no To: line and 2 Pi sessions connected. Message saved in held/.");
   assert.equal(heading, "Reachable Pi sessions:");
   assert.equal(entries.pop(), "Resend directly to pi-<alias> or put To: <alias> on the first line.");
@@ -265,7 +284,30 @@ test("funnel: unaddressed message with two Pi sessions is held and only the send
   assert.equal(typeof at, "number");
   assert.deepEqual(held, { reason: "funnel-unrouted", fromName: "test-cc", text, msgId });
   assert.deepEqual(relayed, [], "neither Pi session receives a relay");
+
+  await post("To: absent\nDo not guess", "no-such-alias");
+  assert.ok(await waitFor(() => fixture.myLines.length >= 4));
+  const secondNotice = parseInboundLine(fixture.myLines[3]);
+  assert.ok(secondNotice.kind === "user");
+  assert.ok(secondNotice.text.startsWith(`${DISCOVERY_HINT}\n\nNot delivered: To: target <absent>`));
+  assert.deepEqual(relayed, [], "the invalid To: target is not relayed");
+
+  sessions[0].client.send("claude:test-cc", { id: "after-discovery", timestamp: Date.now(), content: { text: "Relay after the first reply" } });
+  assert.ok(await waitFor(() => fixture.myLines.length >= 5));
+  const relay = parseInboundLine(fixture.myLines[4]);
+  assert.ok(relay.kind === "user");
+  assert.equal(relay.meta.fromName, "pi-planner");
+  assert.equal(relay.text, "Relay after the first reply");
 });
+
+async function writeCcLine(socketPath: string, line: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    socket.once("connect", () => socket.end(`${line}\n`));
+    socket.once("error", reject);
+    socket.once("close", () => resolve());
+  });
+}
 
 function readDaemonPid(agentDir: string): string {
   try {
@@ -348,6 +390,10 @@ for (const native of [true, false]) {
       assert.ok(token);
       tokens.push(token);
       assert.equal(frame.line.from, native ? inbox : daemonRecord.messagingSocketPath);
+      assert.equal(frame.meta.fromName, native ? "pi-planner" : BRIDGE_NAME);
+      const body = native ? "[Bridge ask:" : '[from pi session planner; reply with first line "To: planner"]';
+      assert.ok(frame.text.startsWith(n === 1 ? `${DISCOVERY_HINT}\n\n${body}` : body));
+      assert.ok(frame.text.endsWith(`\nquestion-${n}`));
     }
     assert.notEqual(tokens[0], tokens[1]);
     await post("unrelated notification", "notification");

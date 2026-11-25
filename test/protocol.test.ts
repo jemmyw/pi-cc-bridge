@@ -1,5 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import net from "node:net";
+import { join } from "node:path";
+import { CcDiscovery } from "../src/cc/discovery.ts";
 import { parseInboundLine, buildOutboundLine, unwrapCrossSessionMessage, buildAuthLine } from "../src/cc/protocol.ts";
 
 /**
@@ -77,6 +81,39 @@ test("rejections mirror CC's inbox reasons", () => {
   assert.equal(action.kind, "action");
   if (action.kind === "action") assert.equal(action.action, "notify_when_idle");
   assert.equal(parseInboundLine('{"type":"auth","token":"t"}').kind, "auth");
+});
+
+test("discovery retries the hint after a failed post and tracks sessions, not sockets", async t => {
+  const dir = mkdtempSync("/tmp/cc-discovery-");
+  const socketPath = join(dir, "inbox.sock");
+  const texts: string[] = [];
+  const server = net.createServer(socket => {
+    let line = "";
+    socket.setEncoding("utf-8");
+    socket.on("data", chunk => { line += chunk; });
+    socket.on("end", () => {
+      const frame = parseInboundLine(line);
+      if (frame.kind === "user") texts.push(frame.text);
+    });
+  });
+  t.after(async () => {
+    if (server.listening) await new Promise<void>(resolve => server.close(() => resolve()));
+    rmSync(dir, { recursive: true, force: true });
+  });
+  const discovery = new CcDiscovery("pi-bridge");
+  const post = (sessionId: string, text: string) => discovery.post(sessionId, {
+    socketPath, senderSocketPath: join(dir, "sender.sock"), senderName: "pi-planner", text, msgId: text, settleMs: 0,
+  });
+  await assert.rejects(post("cc-a", "not delivered"), { code: "ENOENT" });
+  await new Promise<void>((resolve, reject) => server.once("error", reject).listen(socketPath, resolve));
+  await post("cc-a", "first delivery");
+  await post("cc-a", "second delivery");
+  await post("cc-b", "new session");
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  assert.equal(texts.length, 3);
+  assert.match(texts[0], /^\[pi-cc-bridge\].+\n\nfirst delivery$/);
+  assert.equal(texts[1], "second delivery");
+  assert.match(texts[2], /^\[pi-cc-bridge\].+\n\nnew session$/);
 });
 
 test("auth line shape", () => {
