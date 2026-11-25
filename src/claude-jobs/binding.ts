@@ -8,7 +8,7 @@ import { BRIDGE_OWNER, ccSessionsDir, type CcRecord } from "../cc/paths.ts";
 
 export interface JobBinding {
   parentTarget: string;
-  funnelName: string;
+  bridgeName: string;
   watchWorker(sessionId: string, pid: number): void;
   close(): void;
 }
@@ -35,7 +35,7 @@ export async function bindJob(input: {
   }
   const bridge = daemon();
   if (listRecordsSync({ ccSessionsDir: recordsDir }).filter(({ record }) => record.name === bridge.name).length !== 1) {
-    throw new Error("ambiguous bridge funnel name");
+    throw new Error("ambiguous bridge recipient name");
   }
   function check(): void {
     const current = daemon();
@@ -93,7 +93,7 @@ export async function bindJob(input: {
     }, 1000);
     timer.unref();
     return {
-      parentTarget: input.parentTarget, funnelName: bridge.name!,
+      parentTarget: input.parentTarget, bridgeName: bridge.name!,
       watchWorker(sessionId, pid) { worker = { sessionId, pid, ready: false, until: Date.now() + 30_000 }; },
       close,
     };

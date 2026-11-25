@@ -1,45 +1,21 @@
-import { spawn, ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
-import net from "node:net";
-import { createRequire } from "node:module";
+import { lstatSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import { CcRecord, isTargetableRecord, ownSocketPath, ccSocketDir, CcPathsOptions, ensurePrivateDir, ensureSessionsDir } from "./cc/paths.ts";
+import { setTimeout as sleep } from "node:timers/promises";
+import { BRIDGE_OWNER, CcRecord, isTargetableRecord, ownSocketPath, ccSocketDir, CcPathsOptions, ensurePrivateDir, ensureSessionsDir } from "./cc/paths.ts";
 import { gcOwnStaleRecords, listRecordsSync, procStart, selfCheckProcStart, pidDomainFor, writeOwnRecord, removeOwnRecord, isPidAlive } from "./cc/registry.ts";
 import { startCcInbox, CcInboxServer } from "./cc/inbox.ts";
 import { CcDiscovery } from "./cc/discovery.ts";
 import { ParsedInbound } from "./cc/protocol.ts";
 import { BrokerClient, IntercomMessage, BrokerSessionInfo } from "./intercom/client.ts";
 import { BridgeConfig, bridgeStateDir } from "./config.ts";
-import { randomUUID as _uuid } from "node:crypto";
-void _uuid;
-import { allocateHolderAlias, aliasExposed, derivedCcName, isFallbackAlias, matchTarget, parseToHeader, routeFunnel, toCcStatus } from "./routing.ts";
+import { addressLines, isPiSession, routeToPi, toCcStatus, toLineForId } from "./routing.ts";
 import { RateLimiter } from "./ratelimit.ts";
 import { AskReplies, askInstructions } from "./ask-replies.ts";
 export { tryLock } from "./daemon-lock.ts";
 export { runDaemon } from "./daemon.ts";
 
-/**
- * The daemon: discovery loop + relay + holder supervision.
- *
- * pi → CC: every live CC session becomes a synthetic intercom peer (own broker
- *   connection, sessionId `cc-<ccSessionId>`, name `claude:<name>`), capped by
- *   maxPeers. Connection loss is remembered and retried with backoff (P0-2).
- * CC → pi: two paths.
- *   - Native (default on, contact-driven): a holder child per exposed pi
- *     session (config `expose`) — plus lazily for any pi session that messages
- *     CC first — binds its own CC inbox socket and registry record
- *     `pi-<alias>`, so CC addresses pi sessions directly. Children are dumb
- *     socket-holders; the daemon owns routing, trust policy, and relays via
- *     the sending CC session's own peer connection (P0-4, P1-13).
- *   - Funnel fallback: the daemon itself masquerades as one CC session
- *     (`peerName`); messages route via a leading `To: <alias>` line, `routeTo`,
- *     or a single-session roster. Unroutable traffic is HELD, never guessed.
- *
- * Single-instance: a permanent flock guard protects `pid procStart` owner metadata.
- */
-
+/** One Claude-side inbox; one synthetic Intercom peer per live Claude session. */
 interface Peer {
   cc: CcRecord;
   client: BrokerClient;
@@ -47,24 +23,18 @@ interface Peer {
   name: string;
 }
 
-interface HolderState {
-  piSessionId: string;
-  alias: string;
-  childPid?: number;
-  child?: ChildProcess;
-  socket?: net.Socket;
-  socketPath?: string;
-  status?: string;
-  contactedOnly: boolean; // spawned via contact-driven exposure, not config
+interface PendingRelay {
+  sender: CcRecord;
+  target: string;
+  text: string;
+  msgId: string;
+  at: number;
 }
 
-const HOLDER_LINE = 10; // \n
-const MAX_RELAY_BYTES = 900 * 1024; // below CC's ~1M-char refusal (P1-7)
-const SPAWN_COOLDOWN_MS = 10_000;
-const MAX_CRASHES = 5;
+const MAX_RELAY_BYTES = 900 * 1024; // below CC's wire cap
 const HOLD_FAILED = "(hold failed)";
-const isLiveCcRecord = (record: CcRecord) => record.pid !== process.pid && record.kind !== "bridge" &&
-  isTargetableRecord(record) && isPidAlive(record.pid);
+const isLiveCcRecord = (record: CcRecord) => record.pid !== process.pid && record.kind !== "bridge" && record.bridgeOwner !== BRIDGE_OWNER &&
+  isTargetableRecord(record) && Number.isSafeInteger(record.pid) && isPidAlive(record.pid);
 
 export class Bridge {
   private peers = new Map<string, Peer>(); // key: CC sessionId
@@ -73,13 +43,13 @@ export class Bridge {
   private sweepTimer: NodeJS.Timeout | null = null;
   private stopping = false;
   private roster = new Map<string, BrokerSessionInfo>(); // by session id
-  private holders = new Map<string, HolderState>(); // key: pi session id
-  private contacted = new Set<string>(); // pi sessions that messaged CC first
-  private ipcServer: net.Server | null = null;
-  private readonly ipcPath: string;
-  private lastSpawn = new Map<string, { at: number; crashes: number }>();
+  private rosterSource?: BrokerClient;
+  private rosterRequest?: { id: string; at: number; changes: Map<string, BrokerSessionInfo | undefined> };
+  private lastRosterRequestAt = 0;
+  private rosterReady = false;
+  private readonly ccSessionId = randomUUID();
   private retryAt = new Map<string, number>();
-  private pending = new Map<string, { fromSocket?: string; alias: string; at: number }>();
+  private pending = new Map<string, PendingRelay>();
   private warnedOnce = new Set<string>();
   private logOnce = (key: string, msg: string) => {
     if (!this.warnedOnce.has(key)) {
@@ -100,7 +70,6 @@ export class Bridge {
   ) {
     this.heldDir = join(bridgeStateDir(config.agentDir), "held");
     mkdirSync(this.heldDir, { recursive: true, mode: 0o700 });
-    this.ipcPath = join(bridgeStateDir(config.agentDir), "holders-ipc.sock");
     this.discovery = new CcDiscovery(config.peerName);
     this.piLimiter = new RateLimiter(config.relayPerMin, config.relayBurst);
     this.ccLimiter = new RateLimiter(config.relayPerMin, config.relayBurst);
@@ -115,10 +84,10 @@ export class Bridge {
     const records = listRecordsSync(this.paths);
     selfCheckProcStart(records, this.log);
 
-    // Funnel masquerade: identity fields mirror verified CC shapes where possible.
+    // Bridge record: identity fields mirror verified CC shapes where possible.
     const record: CcRecord = {
       pid: process.pid,
-      sessionId: randomUUID(),
+      sessionId: this.ccSessionId,
       cwd: process.cwd(),
       startedAt: Date.now(),
       procStart: procStart(),
@@ -146,13 +115,11 @@ export class Bridge {
     writeOwnRecord(record, this.paths);
     this.log(`bridge inbox at ${socketPath}, registry record written`);
 
-    this.startIpcServer();
-
     this.pollTimer = setInterval(() => this.syncPeers(), this.config.pollMs);
     this.pollTimer.unref?.();
     this.sweepTimer = setInterval(() => this.sweepPending(), 30_000);
     this.sweepTimer.unref?.();
-    await this.syncPeers();
+    this.syncPeers();
   }
 
   async stop(): Promise<void> {
@@ -162,18 +129,7 @@ export class Bridge {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
     for (const peer of this.peers.values()) peer.client.close();
     this.peers.clear();
-    for (const holder of this.holders.values()) this.shutdownHolder(holder);
-    this.holders.clear();
     if (this.inbox) await this.inbox.close();
-    if (this.ipcServer) {
-      await new Promise<void>(done => this.ipcServer!.close(() => done()));
-      try {
-        unlinkSync(this.ipcPath);
-      } catch {
-        /* best effort */
-      }
-      this.ipcServer = null;
-    }
     removeOwnRecord(process.pid, this.paths);
     this.log("bridge stopped");
   }
@@ -185,7 +141,7 @@ export class Bridge {
     if (this.stopping) return;
     const records = listRecordsSync(this.paths);
     selfCheckProcStart(records, this.log);
-    gcOwnStaleRecords(process.pid, this.paths); // dead-pid bridge records (crashed holders) — periodic
+    gcOwnStaleRecords(process.pid, this.paths);
     // Drift detection: an unfamiliar record shape or CC version means our
     // protocol assumptions may be stale — say so loudly, once each (P1-6/P2-10).
     for (const { record, file } of records) {
@@ -206,7 +162,7 @@ export class Bridge {
       }
     }
     const seen = new Set<string>();
-    const usedNames = new Set<string>([this.config.peerName, ...[...this.holders.values()].map(h => `pi-${h.alias}`)]);
+    const usedNames = new Set([...this.peers.values()].map(peer => peer.name));
 
     for (const { record } of records) {
       if (!isLiveCcRecord(record)) continue;
@@ -254,7 +210,7 @@ export class Bridge {
           this.peers.delete(record.sessionId);
         }
         this.retryAt.set(record.sessionId, Date.now() + 5_000);
-        if (this.peers.size === 0) this.clearHoldersAndRoster();
+        this.refreshRosterSource();
       };
       client.on("disconnected", forget);
       client.on("error", (error: Error) => this.log(`peer ${name}: ${error.message}`));
@@ -264,28 +220,33 @@ export class Bridge {
       });
       client.on("registered", () => {
         this.log(`peer registered: ${name} (${sessionId})`);
-        client.list();
+        this.refreshRosterSource();
       });
       client.on("sessions", event => {
-        if (client === this.rosterClient()) this.replaceRoster(event.sessions);
-      });
-      client.on("session_joined", event => {
-        if (client === this.rosterClient()) {
-          this.roster.set(event.session.id, event.session);
-          this.reconcileHolders();
+        const request = this.rosterRequest;
+        if (client !== this.rosterSource || !request || request.id !== event.requestId) return;
+        this.rosterRequest = undefined;
+        const next = new Map<string, BrokerSessionInfo>(event.sessions.map((s: BrokerSessionInfo) => [s.id, s]));
+        // The broker may respond asynchronously after newer roster events arrived.
+        for (const [id, session] of request.changes) {
+          if (session) next.set(id, session);
+          else next.delete(id);
         }
+        for (const [id, old] of this.roster) {
+          const current = next.get(id);
+          if (!current || current.pid !== old.pid || current.endpointEpoch !== old.endpointEpoch) this.asks.clearPi(id);
+        }
+        this.roster = next;
+        this.rosterReady = true;
       });
-      client.on("session_left", event => {
-        if (client === this.rosterClient()) this.onRosterLeft(event.sessionId);
-      });
-      client.on("presence_update", event => {
-        if (client === this.rosterClient()) this.onRosterSession(event.session);
-      });
-      client.on("delivery_failed", event => this.onDeliveryFailed(event.messageId, event.reason));
+      client.on("session_joined", event => this.updateRoster(client, event.session.id, event.session));
+      client.on("session_left", event => this.updateRoster(client, event.sessionId));
+      client.on("presence_update", event => this.updateRoster(client, event.session.id, event.session));
+      client.on("delivery_failed", event => this.onDeliveryFailed(record.sessionId, event.messageId, event.reason));
       client.on("message_receipt", event => {
-        if (event.receipt.status === "injected" || event.receipt.status === "receiver_received") {
-          this.pending.delete(event.receipt.messageId);
-        }
+        const key = pendingKey(record.sessionId, event.receipt.messageId);
+        if (this.pending.get(key)?.target === event.from.id &&
+            (event.receipt.status === "injected" || event.receipt.status === "receiver_received")) this.pending.delete(key);
       });
 
       client
@@ -343,284 +304,49 @@ export class Bridge {
       }
     }
 
-    if (this.peers.size > 0 && this.pollTick++ % 4 === 0) {
-      const first = [...this.peers.values()][0].client;
-      if (first.isRegistered) first.list();
-    }
-    this.reconcileHolders();
+    this.refreshRosterSource();
   }
-  private pollTick = 0;
   private missCount = new Map<string, number>();
   private knownCcVersions = new Set<string>();
   private seenRecordShapes = new Set<string>();
 
-  /** One connection is authoritative for roster events — process broadcasts once (P1-3). */
-  private rosterClient(): BrokerClient | undefined {
-    return [...this.peers.values()].find(p => p.client.isRegistered)?.client;
-  }
-
-  private replaceRoster(sessions: BrokerSessionInfo[]): void {
-    const next = new Map(sessions.map(s => [s.id, s]));
-    for (const [id, holder] of [...this.holders]) {
-      if (!next.has(id)) {
-        this.asks.clearPi(id);
-        this.shutdownHolder(holder);
-        this.holders.delete(id);
-        this.log(`holder retired: ${holder.alias} (left roster)`);
-      }
-    }
-    for (const [id, old] of this.roster) {
-      const current = next.get(id);
-      if (!current || current.pid !== old.pid || current.endpointEpoch !== old.endpointEpoch) this.asks.clearPi(id);
-    }
-    this.roster = next;
-    this.reconcileHolders();
-  }
-
-  private onRosterSession(session: BrokerSessionInfo): void {
-    const old = this.roster.get(session.id);
-    if (old && (old.pid !== session.pid || old.endpointEpoch !== session.endpointEpoch)) this.asks.clearPi(session.id);
-    this.roster.set(session.id, session);
-    const holder = this.holders.get(session.id);
-    if (holder) {
-      const mapped = toCcStatus(session.status);
-      if (mapped !== holder.status) {
-        holder.status = mapped;
-        holder.socket?.write(`${JSON.stringify({ type: "status", status: mapped })}\n`);
-      }
-      const wanted = this.holderNameFor(session);
-      if (wanted && session.name && wanted !== holder.alias) {
-        holder.alias = wanted;
-        holder.socket?.write(`${JSON.stringify({ type: "alias", name: `pi-${wanted}` })}\n`);
-      }
-    }
-    this.reconcileHolders();
-  }
-
-  private onRosterLeft(sessionId: string): void {
-    this.asks.clearPi(sessionId);
-    this.roster.delete(sessionId);
-    const holder = this.holders.get(sessionId);
-    if (holder) {
-      this.shutdownHolder(holder);
-      this.holders.delete(sessionId);
-      this.log(`holder retired: ${holder.alias} (pi session left)`);
-    }
-  }
-
-  private clearHoldersAndRoster(): void {
-    for (const holder of this.holders.values()) this.shutdownHolder(holder);
-    this.holders.clear();
-    this.roster.clear();
-    this.asks.clear();
-  }
-
-  // ── Holders ─────────────────────────────────────────────────────────────────
-
-  /** Spawn/kill holder children so each eligible pi session has a CC entry. */
-  private reconcileHolders(): void {
+  private refreshRosterSource(): void {
     if (this.stopping) return;
-    let spawned = 0;
-    for (const session of this.roster.values()) {
-      if (session.id.startsWith("cc-")) continue; // our own synthetic CC peers
-      if (this.holders.has(session.id)) continue;
-      const rec = this.lastSpawn.get(session.id);
-      if (rec && rec.crashes >= MAX_CRASHES) {
-        this.logOnce(`crashloop-${session.id}`, `holder for ${session.name ?? session.id} crash-looping; giving up`);
-        continue;
-      }
-      if (rec && Date.now() - rec.at < SPAWN_COOLDOWN_MS) continue;
-      if (!this.isExposed(session) && !this.contacted.has(session.id)) continue; // contact-driven (P1-13)
-      if (this.holders.size >= this.config.maxHolders) {
-        this.logOnce("maxHolders", `maxHolders ${this.config.maxHolders} reached; skipping ${session.name ?? session.id}`);
-        break;
-      }
-      this.spawnHolder(session);
-      spawned++;
-      if (spawned >= 3) break; // gentle ramp within one tick
-    }
-  }
-
-  private isExposed(session: BrokerSessionInfo): boolean {
-    const raw = session.name?.trim();
-    const alias = raw && !isFallbackAlias(raw) ? raw : derivedCcName(session.id, session.cwd);
-    return aliasExposed(alias, this.config.expose);
-  }
-
-  private resolveTsx(): string | undefined {
-    try {
-      const pkgDir = join(dirname(fileURLToPath(import.meta.url)), "..");
-      return createRequire(join(pkgDir, "package.json")).resolve("tsx");
-    } catch {
-      const sibling = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "tsx", "dist", "loader.mjs");
-      return existsSync(sibling) ? sibling : undefined;
-    }
-  }
-
-  private spawnHolder(session: BrokerSessionInfo): void {
-    // Prefer the prebuilt plain-JS bundle: no tsx loader in the child (~53MB
-    // vs ~82MB RSS, faster spawn). Fall back to tsx when dist/ is absent.
-    const bundled = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "holder.mjs");
-    const useBundle = existsSync(bundled);
-    const tsx = useBundle ? undefined : this.resolveTsx();
-    if (!useBundle && !tsx) {
-      this.log("holder spawn failed: no dist bundle and tsx loader not resolvable");
-      return;
-    }
-    const aliasBase = this.holderNameFor(session)!;
-    const state: HolderState = { piSessionId: session.id, alias: aliasBase, status: toCcStatus(session.status), contactedOnly: !this.isExposed(session) };
-    this.holders.set(session.id, state);
-    this.lastSpawn.set(session.id, { at: Date.now(), crashes: this.lastSpawn.get(session.id)?.crashes ?? 0 });
-    const spec = {
-      alias: aliasBase,
-      piSessionId: session.id,
-      parentPid: process.pid,
-      ipcPath: this.ipcPath,
-      peerPrefix: "pi-",
-      heldDir: this.heldDir,
-      sessionsDir: this.paths.ccSessionsDir,
-      socketDir: this.paths.socketDir,
-    };
-    const entry = useBundle ? bundled : join(dirname(fileURLToPath(import.meta.url)), "..", "src", "holder.ts");
-    const childArgs = useBundle ? [entry, JSON.stringify(spec)] : ["--import", tsx!, entry, JSON.stringify(spec)];
-    const child = spawn(process.execPath, childArgs, {
-      stdio: ["ignore", "ignore", "pipe"],
-      env: { ...process.env, NODE_NO_WARNINGS: "1" },
-    });
-    state.childPid = child.pid;
-    state.child = child;
-    child.stderr?.on("data", d => this.log(`holder(${aliasBase}): ${d.toString().trim()}`));
-    child.on("error", e => this.log(`holder ${aliasBase} spawn error: ${e.message}`));
-    child.on("exit", code => {
-      const st = this.holders.get(session.id);
-      if (st?.childPid === child.pid) this.holders.delete(session.id); // dead state removed → respawn possible (P1-1)
-      const rec = this.lastSpawn.get(session.id) ?? { at: 0, crashes: 0 };
-      if (!this.stopping && code !== 0) rec.crashes++;
-      rec.at = Date.now();
-      this.lastSpawn.set(session.id, rec);
-      if (!this.stopping && this.roster.has(session.id)) {
-        setTimeout(() => !this.stopping && this.reconcileHolders(), SPAWN_COOLDOWN_MS + 1_000).unref();
-      }
-    });
-    this.log(`holder spawning for pi session ${session.name ?? session.id}`);
-  }
-
-  /** Stable holder alias: never counts the session's own holder as a collision (P1-2). */
-  private holderNameFor(session: BrokerSessionInfo): string {
-    const base = (session.name?.trim() || `sid-${session.id.slice(0, 8)}`).replace(/[^\w.-]/g, "-");
-    const taken = new Set<string>(
-      [...this.holders.values()].filter(h => h.piSessionId !== session.id).map(h => h.alias),
-    );
-    taken.add(this.config.peerName.replace(/^pi-/, ""));
-    for (const { record } of listRecordsSync(this.paths)) {
-      if (record.kind !== "bridge" && record.name?.startsWith("pi-")) taken.add(record.name.slice(3));
-    }
-    const current = this.holders.get(session.id)?.alias;
-    if (current && (current === base || current.startsWith(`${base}#`)) && !taken.has(current)) return current;
-    if (!taken.has(base)) return base;
-    let n = 2;
-    while (taken.has(`${base}#${n}`)) n++;
-    return `${base}#${n}`;
-  }
-
-  private shutdownHolder(holder: HolderState): void {
-    if (holder.socket) {
-      try {
-        holder.socket.write(`${JSON.stringify({ type: "shutdown" })}\n`);
-      } catch {
-        /* best effort */
+    const source = [...this.peers.values()].find(p => p.client.isRegistered && p.client.isConnected)?.client;
+    if (source !== this.rosterSource) {
+      this.rosterSource = source;
+      this.rosterRequest = undefined;
+      this.rosterReady = false;
+      this.lastRosterRequestAt = 0;
+      if (!source) {
+        this.roster.clear();
+        this.asks.clear();
       }
     }
-    if (holder.childPid && isPidAlive(holder.childPid)) {
-      try {
-        process.kill(holder.childPid, "SIGTERM");
-      } catch {
-        /* already gone */
-      }
+    const now = Date.now();
+    if (source && now - this.lastRosterRequestAt >= Math.max(1_000, this.config.pollMs * 4) &&
+        (!this.rosterRequest || now - this.rosterRequest.at >= 5_000)) {
+      this.rosterRequest = { id: source.list(), at: now, changes: new Map() };
+      this.lastRosterRequestAt = now;
     }
   }
 
-  private startIpcServer(): void {
-    // Probe before unlink — never steal another daemon's socket (P0-3).
-    if (existsSync(this.ipcPath)) {
-      const probe = net.createConnection(this.ipcPath);
-      probe.once("connect", () => {
-        probe.destroy();
-        this.log(`IPC socket ${this.ipcPath} is served elsewhere; not starting holders IPC`);
-      });
-      probe.once("error", () => this.bindIpc());
-      probe.setTimeout(500, () => {
-        probe.destroy();
-        this.bindIpc();
-      });
-      return;
-    }
-    this.bindIpc();
+  private updateRoster(client: BrokerClient, id: string, session?: BrokerSessionInfo): void {
+    if (client !== this.rosterSource) return;
+    this.rosterRequest?.changes.set(id, session);
+    const old = this.roster.get(id);
+    if (!session || (old && (old.pid !== session.pid || old.endpointEpoch !== session.endpointEpoch))) this.asks.clearPi(id);
+    if (session) this.roster.set(id, session);
+    else this.roster.delete(id);
   }
 
-  private bindIpc(): void {
-    try {
-      if (existsSync(this.ipcPath)) unlinkSync(this.ipcPath);
-    } catch {
-      /* not present */
-    }
-    this.ipcServer = net.createServer(socket => {
-      let buffer = Buffer.alloc(0);
-      let holder: HolderState | undefined;
-      socket.on("data", chunk => {
-        buffer = Buffer.concat([buffer, chunk]);
-        if (buffer.length > MAX_RELAY_BYTES) {
-          socket.destroy();
-          buffer = Buffer.alloc(0);
-          return;
-        }
-        let idx: number;
-        while ((idx = buffer.indexOf(HOLDER_LINE)) !== -1) {
-          const line = buffer.subarray(0, idx).toString("utf-8").trim();
-          buffer = buffer.subarray(idx + 1);
-          if (!line) continue;
-          let msg: Record<string, unknown>;
-          try {
-            msg = JSON.parse(line) as Record<string, unknown>;
-          } catch {
-            continue;
-          }
-          if (msg.type === "hello" && typeof msg.piSessionId === "string") {
-            holder = this.holders.get(msg.piSessionId);
-            if (holder) {
-              holder.socket = socket;
-              holder.socketPath = typeof msg.socketPath === "string" ? msg.socketPath : undefined;
-              const session = this.roster.get(holder.piSessionId);
-              if (session) socket.write(`${JSON.stringify({ type: "status", status: toCcStatus(session.status) })}\n`);
-              this.log(`holder hello from ${holder.alias} (pid ${String(msg.pid)})`);
-            }
-            continue;
-          }
-          if (!holder) continue;
-          if (msg.type === "cc-message") {
-            this.relayCcToPi(holder, msg);
-          } else if (msg.type === "reply") {
-            void this.sendHolderReply(holder, msg);
-          }
-        }
-      });
-      socket.on("error", () => socket.destroy());
-      socket.on("close", () => {
-        if (holder && holder.socket === socket) holder.socket = undefined;
-      });
-    });
-    this.ipcServer.listen(this.ipcPath, () => this.log(`holder IPC at ${this.ipcPath}`));
-    this.ipcServer.on("error", error => this.log(`ipc: ${error.message}`));
-  }
-
-  // ── Relays ──────────────────────────────────────────────────────────────────
-
-  /** pi → CC. Sender identity: the pi session's own holder entry (P0-4). */
   private async onPiToCc(ccSessionId: string, event: { from: BrokerSessionInfo; message: IntercomMessage }, client: BrokerClient): Promise<void> {
     const peer = this.peers.get(ccSessionId);
     if (!peer || peer.client !== client) return; // read live state, not closure snapshots (P1-6)
     const sender = event.from;
-    const label = sender.name?.trim() || sender.id;
+    if (!isPiSession(sender)) return;
+    const replyLine = toLineForId(sender.id);
+    const label = sender.name ? JSON.stringify(sender.name) : replyLine.slice("To: ".length);
     if (!this.piLimiter.allow(`${sender.id}>${ccSessionId}`)) {
       this.log(`rate limit: pi ${label} → ${peer.name}; message held`);
       this.hold("rate-pi-to-cc", { from: label, to: peer.name, text: event.message.content.text });
@@ -628,48 +354,30 @@ export class Bridge {
       return;
     }
 
-    // Contact-driven exposure: first outbound message earns the holder (P1-13).
-    this.contacted.add(sender.id);
-    this.reconcileHolders();
-
-    let holder = this.holders.get(sender.id);
-    if (!holder) {
-      // First contact: give the holder a moment to bind so the message can go
-      // out natively (from pi-<alias>, reply-addressable). If it is still not
-      // up in time, fall back to the funnel — the send is never lost.
-      this.reconcileHolders();
-      const deadline = Date.now() + 2_000;
-      while (!holder && Date.now() < deadline) {
-        await new Promise(resolve => setTimeout(resolve, 100));
-        holder = this.holders.get(sender.id);
-        if (holder?.socketPath) break;
-      }
-    }
-
-    const native = holder?.socketPath !== undefined;
-    let text = event.message.content.text;
+    const text = event.message.content.text;
     let token: string | undefined;
     try {
       if (this.stopping || this.peers.get(ccSessionId) !== peer) throw new Error("Claude peer disconnected");
       if (event.message.expectsReply) {
         const current = this.roster.get(sender.id);
-        if (!current || current.pid !== sender.pid || current.endpointEpoch !== sender.endpointEpoch) throw new Error("pi sender disconnected or rebound");
+        if (!this.rosterReady || !current || current.pid !== sender.pid || current.endpointEpoch !== sender.endpointEpoch) throw new Error("pi sender disconnected or rebound");
         token = this.asks.add(this.askRoute(peer, sender.id), event.message.id);
-        text = `${askInstructions(token)}\n${text}`;
       }
       await this.discovery.post(peer.cc.sessionId, {
         socketPath: peer.cc.messagingSocketPath,
-        senderSocketPath: native ? holder!.socketPath! : ownSocketPath(this.paths),
-        senderName: native ? `pi-${holder!.alias}` : this.config.peerName,
+        senderSocketPath: ownSocketPath(this.paths),
+        senderName: this.config.peerName,
         senderMode: this.config.piSenderMode,
-        text: native ? text : `[from pi session ${senderLabel(sender)}; reply with first line "To: ${label}"]\n${text}`,
+        text: `From Pi session ${label}. To reply, send to ${JSON.stringify(this.config.peerName)} with this exact first line:\n${replyLine}\n` +
+          (token ? `${askInstructions(token)}\n` : "") + `\nPi message:\n${text}`,
         msgId: event.message.id,
         targetSessionId: peer.cc.sessionId, // CC drops it if the pid was recycled (P2-9)
       });
       client.receipt(event.message.id);
-      this.log(`pi message ${event.message.id} handed to ${peer.name}${native ? ` via pi-${holder!.alias}` : " (funnel)"}`);
+      this.log(`pi message ${event.message.id} handed to ${peer.name}`);
     } catch (error) {
       if (token) this.asks.cancel(token);
+      this.hold("post-failed", { from: sender.id, to: peer.name, text, msgId: event.message.id, error: (error as Error).message });
       this.log(`post to ${peer.name} failed: ${(error as Error).message}`);
       // Tell the pi sender instead of failing silently (P1-7).
       try {
@@ -685,169 +393,68 @@ export class Bridge {
     }
   }
 
-  private reachablePiList(): string | undefined {
-    const names = [...this.holders.values()].map(h => `- pi-${h.alias}`);
-    return names.length ? `Reachable Pi sessions:\n${names.join("\n")}` : undefined;
+  private reachablePiList(): string {
+    if (!this.rosterReady) return "The Pi roster is not available yet. Try /list again shortly.";
+    const lines = addressLines(this.roster.values());
+    return lines.length ? `Reachable Pi sessions:\n${lines.join("\n")}` : "No Pi sessions are currently connected to Intercom.";
   }
 
-  /** CC → pi via a holder entry. Trust policy + routing live HERE, not in the child. */
-  private relayCcToPi(holder: HolderState, msg: Record<string, unknown>): void {
-    const fromSocketRaw = typeof msg.fromSocket === "string" ? msg.fromSocket : undefined;
-    const fromSocket = fromSocketRaw?.startsWith("uds:") ? fromSocketRaw.slice(4) : fromSocketRaw;
-    const fromName = typeof msg.fromName === "string" ? msg.fromName : undefined;
-    const fromMode = typeof msg.fromMode === "string" ? msg.fromMode : "unknown";
-    let text = typeof msg.text === "string" ? msg.text : "";
-    const msgId = typeof msg.msgId === "string" ? msg.msgId : `cc-${randomUUID()}`;
-    if (!text) return;
-
-    // Inbound trust: CC would hold bypass-class senders itself; mirror that (P0-6/P1-13).
-    if (this.config.ccInbound === "hold-bypass" && fromMode !== "prompting" && fromMode !== "unknown-child") {
-      const file = this.hold("bypass-sender", { fromName, fromMode, text, msgId });
-      void this.sendHolderReply(holder, {
-        toSocket: fromSocket,
-        text: `Message held for review (sender class "${fromMode}"): ${file}`,
-        msgId: `held-${msgId}`.slice(0, 128),
-      });
-      this.log(`held bypass-class sender message from ${fromName ?? fromSocket}`);
-      return;
-    }
-
-    if (!this.ccLimiter.allow(`${fromSocket ?? "?"}>${holder.piSessionId}`)) {
-      this.hold("rate-cc-to-pi", { fromName, text, msgId });
-      this.log(`rate limit: ${fromName ?? fromSocket} → ${holder.alias}; held`);
-      return;
-    }
-
-    if (Buffer.byteLength(text) > MAX_RELAY_BYTES) {
-      const file = this.hold("oversize", { fromName, text, msgId });
-      text = `${text.slice(0, 4000)}\n…[truncated; full text: ${file}]`;
-    }
-
-    if (text.trim() === "/list") {
-      void this.sendHolderReply(holder, {
-        toSocket: fromSocket,
-        text: this.reachablePiList() ?? "No other pi sessions are currently connected to intercom.",
-        msgId: `list-${msgId}`.slice(0, 128),
-      });
-      return;
-    }
-
-    // Cross-routing: explicit `To:` header only (never guessed) (P1-8/P1-9).
-    const parsed = parseToHeader(text);
-    if (parsed) {
-      const target = matchTarget(parsed.target, [...this.holders.values()].map(h => ({ id: h.piSessionId, name: h.alias })));
-      if (!target) {
-        const file = this.hold("unknown-address", { fromName, text, msgId, to: parsed.target });
-        this.log(`held: explicit To:${parsed.target} matches no pi session (${file})`);
-        return;
-      }
-      const targetHolder = this.holders.get(target);
-      if (targetHolder) {
-        this.deliverToHolder(targetHolder, fromName, fromSocket, parsed.rest, msgId);
-        return;
-      }
-    }
-
-    this.deliverToHolder(holder, fromName, fromSocket, text, msgId);
-  }
-
-  private deliverToHolder(
-    holder: HolderState,
-    fromName: string | undefined,
-    fromSocket: string | undefined,
-    text: string,
-    msgId: string,
-  ): void {
-    const peer = fromSocket ? [...this.peers.values()].find(p => p.cc.messagingSocketPath === fromSocket) : undefined;
-    if (!peer) {
-      // Unknown sender: re-sync and retry once, then HOLD — never misattribute (P1-4).
-      this.syncPeers();
-      setTimeout(() => {
-        const retryPeer = fromSocket ? [...this.peers.values()].find(p => p.cc.messagingSocketPath === fromSocket) : undefined;
-        if (retryPeer) {
-          this.deliverToHolder(holder, fromName, fromSocket, text, msgId);
-        } else {
-          const file = this.hold("unknown-sender", { fromName, fromSocket, text, msgId });
-          this.log(`held: sender ${fromName ?? fromSocket} matches no CC session (${file})`);
-        }
-      }, 3_000).unref();
-      return;
-    }
-    if (this.relayCcMessage(peer, holder.piSessionId, text, msgId)) {
-      this.pending.set(msgId, { fromSocket, alias: holder.alias, at: Date.now() });
-      this.log(`cc message from ${ccNameFor(peer)} relayed to ${holder.alias}`);
-    }
-  }
-
-  private onDeliveryFailed(messageId: string, reason: string): void {
-    const p = this.pending.get(messageId);
-    if (!p) return;
-    this.pending.delete(messageId);
-    this.hold("delivery_failed", { ...p, reason });
-    if (p.fromSocket) {
-      void this.noticeToCc(p.fromSocket, p.alias, `Not delivered to pi-${p.alias}: ${reason}. Queued at held/.`, undefined, true);
-    }
+  private onDeliveryFailed(ccSessionId: string, msgId: string, reason: string): void {
+    const key = pendingKey(ccSessionId, msgId);
+    const pending = this.pending.get(key);
+    if (!pending) return;
+    this.pending.delete(key);
+    void this.holdCc("delivery_failed", pending, `Broker could not deliver to ${pending.target}: ${reason}`);
   }
 
   private sweepPending(): void {
     this.asks.sweep();
     const now = Date.now();
-    for (const [msgId, p] of this.pending) {
-      if (now - p.at < 60_000) continue;
-      this.pending.delete(msgId);
-      if (p.fromSocket) {
-        void this.noticeToCc(p.fromSocket, p.alias, `pi-${p.alias} has not picked up your message after 60s (busy or non-interactive); queued at held/.`, undefined, true);
-      }
+    for (const [key, pending] of this.pending) {
+      if (now - pending.at < 60_000) continue;
+      this.pending.delete(key);
+      void this.holdCc("delivery-timeout", pending, `No receipt from ${pending.target} after 60 seconds`);
     }
   }
 
-  /** Child-initiated reply, posted back to the CC sender's own socket. */
-  private async sendHolderReply(holder: HolderState, msg: Record<string, unknown>): Promise<void> {
-    const toSocketRaw = typeof msg.toSocket === "string" ? msg.toSocket : undefined;
-    const toSocket = toSocketRaw?.startsWith("uds:") ? toSocketRaw.slice(4) : toSocketRaw;
-    if (!toSocket || typeof msg.text !== "string") return;
-    await this.noticeToCc(toSocket, holder.alias, msg.text, typeof msg.msgId === "string" ? msg.msgId : undefined);
-  }
-
-  /**
-   * Reply-target validation (P2-1): the daemon only ever posts to sockets that
-   * belong to a live CC session record or one of our own holders. A forged
-   * `from` in message content can never aim the bridge at an arbitrary socket.
-   */
-  private isAllowedReplySocket(socketPath: string): boolean {
-    const bare = socketPath.startsWith("uds:") ? socketPath.slice(4) : socketPath;
-    if (!bare.startsWith(ccSocketDir(this.paths) + "/")) return false; // only CC's runtime dir
-    for (const peer of this.peers.values()) if (peer.cc.messagingSocketPath === bare) return true;
-    for (const holder of this.holders.values()) if (holder.socketPath === bare) return true;
-    for (const { record } of listRecordsSync(this.paths)) {
-      if (record.kind !== "bridge" && record.messagingSocketPath === bare && isPidAlive(record.pid)) return true;
-    }
-    return false;
-  }
-
-  private ccSessionIdForSocket(socketPath: string): string | undefined {
-    return this.findPeerBySender(socketPath)?.cc.sessionId ?? listRecordsSync(this.paths)
-      .find(({ record }) => record.messagingSocketPath === socketPath && isLiveCcRecord(record))?.record.sessionId;
-  }
-
-  private async noticeToCc(socketPath: string, alias: string | undefined, text: string, msgId?: string, alwaysHint = false): Promise<void> {
-    if (!this.isAllowedReplySocket(socketPath)) {
-      this.log(`refused reply to unvalidated socket ${socketPath}`);
-      return;
-    }
+  private liveCcSender(socketPath: string | undefined): CcRecord | undefined {
+    if (!socketPath || dirname(socketPath) !== join(ccSocketDir(this.paths), ".")) return undefined;
     try {
-      await this.discovery.post(this.ccSessionIdForSocket(socketPath), {
+      if (!lstatSync(socketPath).isSocket()) return undefined;
+    } catch {
+      return undefined;
+    }
+    const matches = listRecordsSync(this.paths).map(({ record }) => record)
+      .filter(record => record.messagingSocketPath === socketPath && isLiveCcRecord(record));
+    return matches.length === 1 ? matches[0] : undefined;
+  }
+
+  private async noticeToCc(sender: CcRecord, text: string, msgId = `notice-${randomUUID()}`, alwaysHint = false): Promise<void> {
+    const socketPath = sender.messagingSocketPath;
+    const current = this.liveCcSender(socketPath);
+    if (!current || !sameCcIdentity(current, sender)) return;
+    try {
+      await this.discovery.post(sender.sessionId, {
         socketPath,
         senderSocketPath: ownSocketPath(this.paths),
         senderName: this.config.peerName,
         senderMode: this.config.piSenderMode,
+        targetSessionId: sender.sessionId,
         text,
-        msgId: msgId ?? `notice-${randomUUID()}`.slice(0, 128),
+        msgId,
       }, alwaysHint);
-      this.log(`notice sent to ${socketPath}${alias === undefined ? "" : ` (about pi-${alias})`}`);
     } catch (error) {
       this.log(`notice to ${socketPath} failed: ${(error as Error).message}`);
     }
+  }
+
+  private async holdCc(reason: string, payload: { sender: CcRecord; text: string; msgId: string; target?: string },
+    explanation: string, correction = ""): Promise<void> {
+    const { sender, text, msgId, target } = payload;
+    const file = this.hold(reason, { from: sender.sessionId, fromSocket: sender.messagingSocketPath, text, msgId, target });
+    this.log(`held ${msgId} from ${sender.sessionId} (${reason}): ${file}`);
+    const saved = file === HOLD_FAILED ? "Could not save the message in held/." : "Message saved in held/.";
+    await this.noticeToCc(sender, `Not delivered: ${explanation}. ${saved}${correction}`, undefined, Boolean(correction));
   }
 
   /** Unified hold: sanitized filename, never guessed onward. (P1-7, P1-17) */
@@ -864,78 +471,71 @@ export class Bridge {
   }
 
   private async onCcFrame(frame: ParsedInbound): Promise<void> {
+    if (this.stopping) return;
     if (frame.kind !== "user") {
       if (frame.kind === "action") this.log(`cc action frame: ${frame.action} (ignored)`);
       else if (frame.kind === "unknown") this.log(`cc line dropped: ${frame.reason}`);
       return;
     }
-    const fromSocket = frame.line.from ?? frame.meta.from;
-    const fromName = frame.meta.fromName ?? fromSocket ?? "claude-session";
+    const { text, line, meta } = frame;
+    if (line.session_id !== undefined && line.session_id !== this.ccSessionId) return;
+    const msgId = line.msg_id;
+    const fromSocket = bareSocket(line.from ?? meta.from);
+    const sender = this.liveCcSender(fromSocket);
+    if (!sender || (line.from && meta.from && bareSocket(meta.from) !== fromSocket)) {
+      this.hold("unknown-sender", { fromSocket, text, msgId });
+      return;
+    }
+    const payload = { sender, text, msgId };
 
-    if (frame.text.trim() === "/list") {
-      const list = this.reachablePiList();
-      try {
-        const socketPath = fromSocket?.startsWith("uds:") ? fromSocket.slice(4) : fromSocket ?? "";
-        await this.discovery.post(this.ccSessionIdForSocket(socketPath), {
-          socketPath,
-          senderSocketPath: ownSocketPath(this.paths),
-          senderName: this.config.peerName,
-          senderMode: this.config.piSenderMode,
-          text: list
-            ? `${list}\n(You can SendMessage these directly, or use the funnel with a leading "To: <name>" line.)`
-            : "No other pi sessions are currently connected to intercom.",
-          msgId: `list-${frame.line.msg_id}`.slice(0, 128),
-        });
-        this.log(`list query from ${fromName} answered with ${this.holders.size} sessions`);
-      } catch (error) {
-        this.log(`list reply to ${fromName} failed: ${(error as Error).message}`);
+    // Discovery never injects into Pi, but only a registered Claude socket gets a reply.
+    if (text.trim() === "/list") {
+      if (!this.ccLimiter.allow(`list:${sender.sessionId}`)) {
+        await this.holdCc("rate-list", payload, "bridge /list rate limit reached");
+        return;
       }
+      if (!this.rosterReady) {
+        this.syncPeers();
+        const deadline = Date.now() + 1_000;
+        while (!this.rosterReady && !this.stopping && Date.now() < deadline) await sleep(25);
+        if (this.stopping) return;
+      }
+      await this.noticeToCc(sender, `${this.reachablePiList()}\nCopy a To: line to the first line of your message to ${JSON.stringify(this.config.peerName)}.`, `list-${msgId}`.slice(0, 128));
+      return;
+    }
+    if (this.config.ccInbound === "hold-bypass" && meta.fromMode !== "prompting" && meta.fromMode !== "unknown-child") {
+      await this.holdCc("bypass-sender", payload, `sender class ${JSON.stringify(meta.fromMode ?? "unknown")} is held by policy`);
+      return;
+    }
+    if (Buffer.byteLength(text) > MAX_RELAY_BYTES) {
+      await this.holdCc("oversize", payload, "message exceeds the relay size limit");
       return;
     }
 
-    const route = routeFunnel(frame.text, this.roster.values(), this.config.routeTo);
-    const { target, text } = route;
-    if (!target) {
-      const file = this.hold("funnel-unrouted", { fromName, text, msgId: frame.line.msg_id });
-      this.log(`cc message from ${fromName} held (no route): ${file}`);
-      const socket = fromSocket?.startsWith("uds:") ? fromSocket.slice(4) : fromSocket;
-      const registered = socket && listRecordsSync(this.paths).some(({ record }) => record.messagingSocketPath === socket && isLiveCcRecord(record));
-      if (!socket || (registered && !existsSync(socket))) {
-        this.log(`skipped funnel notice to ${fromName}: sender socket absent`);
-        return;
-      }
-      if (!registered) {
-        this.log(`refused funnel notice to ${fromName}: no live CC record for ${socket}`);
-        return;
-      }
-      const reason = route.reason === "to-miss" ? `To: target <${route.requested}> matches no Pi session`
-        : route.reason === "several" ? `no To: line and ${route.count} Pi sessions connected` : "no Pi sessions connected";
-      const saved = file === HOLD_FAILED ? "Could not save the message in held/." : "Message saved in held/.";
-      const list = this.reachablePiList();
-      await this.noticeToCc(socket, undefined, `Not delivered: ${reason}. ${saved}\n${list ? `${list}\n` : ""}` +
-        "Resend directly to pi-<alias> or put To: <alias> on the first line.", undefined, true);
+    const route = routeToPi(text, this.rosterReady ? this.roster.values() : []);
+    if (!route.target) {
+      const explanation = route.reason === "ambiguous" ? `To: target ${JSON.stringify(route.requested)} is ambiguous`
+        : route.reason === "unknown" ? `To: target ${JSON.stringify(route.requested)} matches no reachable Pi session`
+        : route.reason === "empty" ? "no message body after the To: line" : "missing or invalid first-line To: address";
+      await this.holdCc(`route-${route.reason}`, payload, explanation, "\nSend /list to the bridge for a current, copyable To: line.");
       return;
     }
-    const peer = this.findPeerBySender(fromSocket);
-    const client = peer?.client;
-    if (!client) {
+    const target = route.target;
+    if (!this.ccLimiter.allow(`relay:${sender.sessionId}>${target.id}`)) {
+      await this.holdCc("rate-cc-to-pi", { ...payload, target: target.id }, "bridge relay rate limit reached");
+      return;
+    }
+    const peer = this.peers.get(sender.sessionId);
+    if (!peer || !sameCcIdentity(peer.cc, sender) || !peer.client.isRegistered || !peer.client.isConnected) {
       this.syncPeers();
-      setTimeout(() => {
-        const retry = this.findPeerBySender(fromSocket);
-        if (!retry) {
-          const file = this.hold("unknown-sender", { fromName, fromSocket, text, msgId: frame.line.msg_id });
-          this.log(`held: funnel sender ${fromName} matches no CC session (${file})`);
-          return;
-        }
-        void this.relayFunnelToPi(retry, target, text, frame.line.msg_id, fromName);
-      }, 3_000).unref();
+      await this.holdCc("sender-unavailable", payload, "your Intercom peer is not ready; resend shortly");
       return;
     }
-    void this.relayFunnelToPi(peer, target, text, frame.line.msg_id, fromName);
-  }
-
-  private async relayFunnelToPi(peer: Peer, target: string, text: string, msgId: string, fromName: string): Promise<void> {
-    if (this.relayCcMessage(peer, target, text, msgId)) this.log(`cc message from ${fromName} relayed to ${target}`);
+    if (!peer.client.supportsExactSend || !target.endpointEpoch) {
+      await this.holdCc("exact-send-unavailable", payload, "the Intercom broker does not support exact endpoint delivery; upgrade pi-intercom");
+      return;
+    }
+    await this.relayCcMessage(peer, target, route.text, msgId, sender, text);
   }
 
   private askRoute(peer: Peer, target: string) {
@@ -949,32 +549,27 @@ export class Bridge {
     } catch (error) { this.log(`ask failure reply failed: ${(error as Error).message}`); }
   }
 
-  private relayCcMessage(peer: Peer, target: string, text: string, msgId: string): boolean {
-    const reply = this.asks.match(this.askRoute(peer, target), text);
+  private async relayCcMessage(peer: Peer, target: BrokerSessionInfo, text: string, msgId: string, sender: CcRecord, original: string): Promise<void> {
+    const held = { sender, target: target.id, text: original, msgId };
+    const reply = this.asks.match(this.askRoute(peer, target.id), text);
     if (text.startsWith("Bridge-Reply:") && !reply) {
-      this.hold("invalid-ask-reply", { from: peer.cc.sessionId, target, text, msgId });
-      return false;
+      await this.holdCc("invalid-ask-reply", held, "invalid, expired or already used Bridge-Reply token");
+      return;
     }
+    const key = pendingKey(sender.sessionId, msgId);
+    if (this.pending.has(key)) return;
+    this.pending.set(key, { ...held, at: Date.now() });
     try {
-      peer.client.send(target, { id: msgId, timestamp: Date.now(),
+      peer.client.sendExact(target, { id: msgId, timestamp: Date.now(),
         content: { text: `Message from Claude Code session ${ccNameFor(peer)}:\n${reply?.text ?? text}` },
         ...(reply ? { replyTo: reply.replyTo } : {}),
       });
       if (reply) this.asks.cancel(reply.token);
-      return true;
+      this.log(`cc message from ${ccNameFor(peer)} submitted to ${target.id}`);
     } catch (error) {
-      this.hold("send-failed", { from: peer.cc.sessionId, target, text, msgId, error: (error as Error).message });
-      return false;
+      this.pending.delete(key);
+      await this.holdCc("send-failed", held, `broker send failed: ${(error as Error).message}`);
     }
-  }
-
-  private findPeerBySender(senderSocket: string | undefined): Peer | undefined {
-    if (!senderSocket) return undefined;
-    const bare = senderSocket.startsWith("uds:") ? senderSocket.slice(4) : senderSocket;
-    for (const peer of this.peers.values()) {
-      if (peer.cc.messagingSocketPath === bare) return peer;
-    }
-    return undefined;
   }
 
   private agentDir(): string {
@@ -986,11 +581,16 @@ export class Bridge {
   }
 }
 
-/** Human label for a pi session; runtime fallback aliases read as strangers. */
-function senderLabel(sender: { name?: string; cwd?: string; id: string }): string {
-  const name = sender.name?.trim();
-  if (name && !isFallbackAlias(name)) return name;
-  return `pi session ${derivedCcName(sender.id, sender.cwd)}`;
+function bareSocket(socket?: string): string | undefined {
+  return socket?.startsWith("uds:") ? socket.slice(4) : socket;
+}
+
+function sameCcIdentity(a: CcRecord, b: CcRecord): boolean {
+  return a.sessionId === b.sessionId && a.pid === b.pid && a.procStart === b.procStart && a.messagingSocketPath === b.messagingSocketPath;
+}
+
+function pendingKey(ccSessionId: string, msgId: string): string {
+  return JSON.stringify([ccSessionId, msgId]);
 }
 
 function ccNameFor(peer: Peer): string {

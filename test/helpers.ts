@@ -42,11 +42,8 @@ export function piSubagentsDir(): string | undefined {
 
 export const BROKER_ENTRY = join(piIntercomDir() ?? "", "broker", "broker.ts");
 export const SKIP = !existsSync(BROKER_ENTRY);
-export const SKIP_REASON: string | boolean = SKIP
-  ? process.env.PI_CC_BRIDGE_STRICT === "1"
-    ? "pi-intercom broker not found; refusing to skip in strict mode"
-    : true
-  : false;
+if (SKIP && process.env.PI_CC_BRIDGE_STRICT === "1") throw new Error(`pi-intercom broker not found at ${BROKER_ENTRY}; refusing to skip in strict mode`);
+export const SKIP_REASON = SKIP;
 
 export function resolveTsx(): string | undefined {
   try {

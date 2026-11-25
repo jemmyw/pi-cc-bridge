@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseInboundLine, buildOutboundLine, unwrapCrossSessionMessage } from "../src/cc/protocol.ts";
 import { procStart } from "../src/cc/registry.ts";
-import { aliasExposed, allocateHolderAlias, derivedCcName, isFallbackAlias, matchTarget, parseToHeader, routeFunnel, toCcStatus } from "../src/routing.ts";
+import { addressLines, parseToHeader, routeToPi, toCcStatus, toLineForId } from "../src/routing.ts";
 import { RateLimiter } from "../src/ratelimit.ts";
 import { createFrameReader } from "../src/intercom/framing.ts";
 
@@ -28,27 +28,35 @@ test("procStart: real file on this machine does not return the itrealvalue zero"
   assert.notEqual(mine, "0", "procStart must not be field 21 (itrealvalue, always 0)");
 });
 
-test("To: header: case-sensitive, single line, pi- prefix resolvable", () => {
-  assert.deepEqual(parseToHeader("To: planner\nhello"), { target: "planner", rest: "hello" });
-  assert.deepEqual(parseToHeader("To: pi-planner\nhello"), { target: "pi-planner", rest: "hello" });
-  assert.equal(parseToHeader("To:\nbody"), undefined, "\\s* must not cross newlines");
-  assert.equal(parseToHeader("to: lowercase prose"), undefined, "prose must not route");
-  assert.deepEqual(parseToHeader("To: planner"), { target: "planner", rest: "" });
-});
-
-test("matchTarget: id, bare alias, and pi- prefixed entry all resolve", () => {
-  const roster = [{ id: "aaa", name: "planner" }, { id: "bbb", name: "worker" }];
-  assert.equal(matchTarget("aaa", roster), "aaa");
-  assert.equal(matchTarget("planner", roster), "aaa");
-  assert.equal(matchTarget("pi-planner", roster), "aaa", "holder-entry spelling resolves");
-  assert.equal(matchTarget("missing", roster), undefined);
-});
-
-test("aliasExposed: exact, prefix glob, and wildcard", () => {
-  assert.equal(aliasExposed("planner", ["planner"]), true);
-  assert.equal(aliasExposed("planner-2", ["planner*"]), true);
-  assert.equal(aliasExposed("worker", ["*"]), true);
-  assert.equal(aliasExposed("worker", ["planner*"]), false);
+test("explicit Pi routing: exact quoted IDs, unique bare names, and no fallbacks", () => {
+  const planner = { id: "planner-id", name: "planner" };
+  const duplicate = { id: "other-id", name: "PLANNER" };
+  const collision = { id: "third-id", name: "planner-id" };
+  const escaped = { id: 'has "quotes" and\nline breaks', name: "two words" };
+  const synthetic = { id: "cc-123", name: "claude:test" };
+  const roster = [planner, duplicate, collision, escaped, synthetic];
+  const body = " hello\n\n ";
+  assert.deepEqual(routeToPi(`To: PLANNER\n${body}`, [planner]), { target: planner, text: body });
+  assert.equal(routeToPi("To: planner\nbody", roster).reason, "ambiguous");
+  assert.equal(routeToPi("To: planner-id\nbody", roster).reason, "ambiguous");
+  assert.equal(routeToPi('To: "planner-id"\nbody', [collision]).reason, "unknown");
+  for (const target of ["pi-planner", "plan", "cc-123", '"cc-123"', "claude:test"]) {
+    assert.equal(routeToPi(`To: ${target}\nbody`, roster).reason, "unknown");
+  }
+  for (const text of ["plain", "to: planner\nbody", "To:\nplanner", "\nTo: planner\nbody", 'To: "planner-id\nbody']) {
+    assert.equal(routeToPi(text, [planner]).reason, "missing");
+  }
+  assert.equal(routeToPi("To: planner", [planner]).reason, "empty");
+  assert.deepEqual(parseToHeader(`${toLineForId(escaped.id)}\r\n${body}`), { target: escaped.id, exact: true, rest: body });
+  const lines = addressLines(roster);
+  assert.equal(lines.length, 4);
+  assert.equal(new Set(lines).size, 4);
+  for (const session of roster.slice(0, -1)) {
+    const line = toLineForId(session.id);
+    assert.ok(lines.includes(line));
+    assert.equal(routeToPi(`${line}\nbody`, roster).target, session);
+  }
+  assert.deepEqual(addressLines([planner, synthetic]), ["To: planner"]);
 });
 
 test("toCcStatus maps pi presence onto CC's two-value model", () => {
@@ -102,72 +110,4 @@ test("rate limiter: burst then refill", () => {
   t += 10_000; // 10s → 6/min = 1 token
   assert.equal(rl.allow("k", t), true);
   assert.equal(rl.allow("k", t), false);
-});
-
-test("allocateHolderAlias: stable under presence storms (critic P1-2 table)", () => {
-  const session = { id: "s1", name: "x" };
-  const holders = [{ piSessionId: "s1", alias: "x" }];
-  // Own holder must NOT be a collision: repeated calls return the same alias forever.
-  for (let i = 0; i < 20; i++) {
-    assert.equal(allocateHolderAlias({ session, holders, ccPiNames: [], peerName: "pi-bridge" }), "x");
-  }
-  // Second session with the same name gets x#2 — and keeps it.
-  const session2 = { id: "s2", name: "x" };
-  assert.equal(
-    allocateHolderAlias({ session: session2, holders, ccPiNames: [], peerName: "pi-bridge" }),
-    "x#2",
-  );
-  const holders2 = [...holders, { piSessionId: "s2", alias: "x#2" }];
-  for (let i = 0; i < 20; i++) {
-    assert.equal(allocateHolderAlias({ session: session2, holders: holders2, ccPiNames: [], peerName: "pi-bridge" }), "x#2");
-    assert.equal(allocateHolderAlias({ session, holders: holders2, ccPiNames: [], peerName: "pi-bridge" }), "x");
-  }
-  // CC-namespace pi-* names are respected, and the funnel reserves its own.
-  assert.equal(
-    allocateHolderAlias({ session: { id: "s3", name: "bridge" }, holders: holders2, ccPiNames: ["bridge"], peerName: "pi-bridge" }),
-    "bridge#2",
-  );
-});
-
-test("routeFunnel: explicit addresses hold, never reroute (critic P1-8 table)", () => {
-  const roster = [
-    { id: "aaa", name: "planner" },
-    { id: "bbb", name: "worker" },
-    { id: "cc-1", name: "claude:test-cc" },
-  ];
-  // To: resolves (bare or pi- spelling), strips the header, explicit-unknown holds
-  assert.deepEqual(routeFunnel("To: worker\ndo the thing", roster, undefined), { reason: "to-hit", target: "bbb", text: "do the thing" });
-  assert.deepEqual(routeFunnel("To: pi-planner\nhi", roster, "worker"), { reason: "to-hit", target: "aaa", text: "hi" });
-  const miss = { reason: "to-miss", target: undefined, requested: "nobody", text: "To: nobody\nhi" };
-  assert.deepEqual(routeFunnel(miss.text, roster, "planner"), miss);
-  assert.deepEqual(routeFunnel(miss.text, roster.slice(0, 1), undefined), miss);
-  assert.deepEqual(routeFunnel("plain", roster, "planner"), { reason: "route-to-hit", target: "aaa", text: "plain" });
-  assert.deepEqual(routeFunnel("plain", roster.slice(1), "missing"), { reason: "single", target: "bbb", text: "plain" });
-  assert.deepEqual(routeFunnel("plain", roster, undefined), { reason: "several", target: undefined, count: 2, text: "plain" });
-  assert.deepEqual(routeFunnel("plain", roster.slice(-1), undefined), { reason: "zero", target: undefined, text: "plain" });
-});
-
-test("derivedCcName: CC's derived-name convention (basename + 2 hex), stable", () => {
-  const a = derivedCcName("11111111-1111-1111-1111-111111111111", "/home/mauro/projects/systemfix");
-  const b = derivedCcName("11111111-1111-1111-1111-111111111111", "/home/mauro/projects/systemfix");
-  assert.equal(a, b, "deterministic across calls/restarts");
-  assert.match(a, /^systemfix-[0-9a-f]{2}$/, "basename + exactly 2 lowercase hex");
-  assert.equal(derivedCcName("22222222-2222-2222-2222-222222222222", "/home/mauro/projects/tmp"), derivedCcName("22222222-2222-2222-2222-222222222222", "/home/mauro/projects/tmp"));
-});
-
-test("allocateHolderAlias: unnamed sessions get the CC-derived name, fallback aliases never shown", () => {
-  assert.equal(isFallbackAlias("subagent-chat-01a12935-b66d"), true);
-  const alias = allocateHolderAlias({
-    session: { id: "abc", name: "subagent-chat-01a12935-b66d-7104" },
-    holders: [],
-    ccPiNames: [],
-    peerName: "pi-bridge",
-    unnamedBase: derivedCcName("abc", "/home/mauro/projects/systemfix"),
-  });
-  assert.match(alias, /^systemfix-[0-9a-f]{2}$/, "unnamed session takes the CC-derived base");
-  // named sessions are untouched
-  assert.equal(
-    allocateHolderAlias({ session: { id: "x", name: "planner" }, holders: [], ccPiNames: [], peerName: "pi-bridge" }),
-    "planner",
-  );
 });

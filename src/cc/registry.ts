@@ -7,7 +7,7 @@ import { CcRecord, ccSessionsDir, CcPathsOptions, BRIDGE_OWNER } from "./paths.t
 /**
  * Reader/writer for Claude Code's sessions registry (<sessionsDir>/<pid>.json).
  *
- * The daemon and holders write exactly one record each — their own — marked
+ * The daemon writes one record, its own, marked
  * with `bridgeOwner`. Removal is limited to bridgeOwner records with dead pids
  * (our own previous incarnations) — never other sessions' records. (P0-1)
  */

@@ -5,7 +5,7 @@ export class CcDiscovery {
   private readonly firstPosts = new Map<string, Promise<void>>();
 
   constructor(peerName: string) {
-    this.hint = `[pi-cc-bridge] Send /list to the bridge peer ${JSON.stringify(peerName)} to find reachable Pi sessions, then message pi-<alias> directly.`;
+    this.hint = `[pi-cc-bridge] Send /list to the bridge peer ${JSON.stringify(peerName)} to find reachable Pi sessions. Send messages to this same peer with a first-line To: address.`;
   }
 
   async post(sessionId: string | undefined, options: PostOptions, alwaysHint = false): Promise<void> {

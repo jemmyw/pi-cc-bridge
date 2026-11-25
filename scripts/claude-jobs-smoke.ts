@@ -17,7 +17,7 @@ const nonce = randomUUID();
 const root = mkdtempSync(join(tmpdir(), "claude-jobs-live-"));
 const fixture = join(root, "fixture");
 const parentId = randomUUID();
-const funnelName = `pi-job-smoke-${nonce}`;
+const bridgeName = `pi-job-smoke-${nonce}`;
 const children: ChildProcess[] = [];
 const parent = new BrokerClient(root);
 let jobs: ClaudeJobs | undefined;
@@ -48,12 +48,12 @@ try {
   const git = spawn("git", ["init", "-q", fixture], { stdio: "ignore" });
   await new Promise<void>((done, reject) => { git.once("error", reject); git.once("exit", code => code === 0 ? done() : reject(new Error("git init failed"))); });
   mkdirSync(join(root, "pi-cc-bridge"));
-  writeFileSync(join(root, "pi-cc-bridge/config.json"), JSON.stringify({ peerName: funnelName, pollMs: 500,
-    expose: [], maxHolders: 1, logLevel: "quiet" }), { mode: 0o600 });
+  writeFileSync(join(root, "pi-cc-bridge/config.json"), JSON.stringify({ peerName: bridgeName, pollMs: 500,
+    logLevel: "quiet" }), { mode: 0o600 });
   launch(["--import", tsx, join(intercom!, "broker/broker.ts")]);
   await wait("isolated broker", () => existsSync(join(root, "intercom/broker.sock")));
   const daemon = launch(["--import", tsx, resolve("src/cli.ts")]);
-  await wait("verified funnel", () => readRecordFile(join(ccSessionsDir(), `${daemon.pid}.json`))?.name === funnelName);
+  await wait("verified bridge recipient", () => readRecordFile(join(ccSessionsDir(), `${daemon.pid}.json`))?.name === bridgeName);
   parent.on("error", () => {});
   parent.on("message", message => messages.push(message));
   await parent.connectAndRegister(parentId, { cwd: fixture, pid: process.pid, model: "provider-live-parent",
@@ -65,7 +65,7 @@ try {
   const question = `DECISION ${nonce}`;
   const answer = `APPROVED ${nonce}`;
   const output = join(fixture, "owned-proof.txt");
-  const prompt = `Only work in this private fixture ${fixture}. Do not edit any other path. First ask the bound parent via the funnel exactly '${question}: may I write the proof file?'. Do not write until the parent replies '${answer}'. End the waiting turn using the prescribed WAIT protocol. After receiving the actual cross-session answer, write owned-proof.txt containing exactly '${answer}', read it back and complete using the prescribed DONE protocol. This smoke must use native SendMessage for the question and a native cross-session reply for the answer, not stdin steering. Ignore any unrelated messages.`;
+  const prompt = `Only work in this private fixture ${fixture}. Do not edit any other path. First ask the bound parent via the bridge exactly '${question}: may I write the proof file?'. Do not write until the parent replies '${answer}'. End the waiting turn using the prescribed WAIT protocol. After receiving the actual cross-session answer, write owned-proof.txt containing exactly '${answer}', read it back and complete using the prescribed DONE protocol. This smoke must use native SendMessage for the question and a native cross-session reply for the answer, not stdin steering. Ignore any unrelated messages.`;
   const handle = await jobs.start({ sessionId: parentId, prompt, promptDigest: createHash("sha256").update(prompt).digest("hex"),
     cwd: fixture, runId: randomUUID(), stepIndex: 0, agent: "claude-job-worker", options: { scope: fixture, timeoutMs: 180_000 } });
   handleId = handle.providerJobId;
@@ -80,7 +80,7 @@ try {
   await wait("continued native answer and explicit completion", () => jobs!.status(handleId!).state !== "running", 120_000);
   assert.equal(jobs.status(handleId).state, "completed", JSON.stringify(jobs.status(handleId)));
   assert.equal(readFileSync(output, "utf8").trim(), answer);
-  console.log("PASS native question -> exact parent answer -> retained-context edit -> explicit provider completion; expose=[]; no stdin answer");
+  console.log("PASS native question -> exact parent answer -> retained-context edit -> explicit provider completion; no stdin answer");
 } finally {
   jobs?.close(); dispose?.(); parent.close();
   // Allow the provider guardian to reap its own process group before stopping the bridge.
@@ -90,7 +90,7 @@ try {
     await wait("owned child exit", () => child.exitCode !== null || child.signalCode !== null, 5000);
     const recordPath = join(ccSessionsDir(), `${child.pid}.json`);
     const record = readRecordFile(recordPath);
-    if (record && !isPidAlive(record.pid) && record.bridgeOwner === "pi-cc-bridge" && record.name === funnelName) rmSync(recordPath);
+    if (record && !isPidAlive(record.pid) && record.bridgeOwner === "pi-cc-bridge" && record.name === bridgeName) rmSync(recordPath);
   }
   rmSync(root, { recursive: true, force: true });
 }

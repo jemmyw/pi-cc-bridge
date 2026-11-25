@@ -1,7 +1,7 @@
 {
   "name": "pi-cc-bridge",
   "version": "0.3.0",
-  "description": "Session-to-session messaging between pi coding-agent and Claude Code: your pi sessions appear in Claude Code /list-agents and your Claude Code sessions appear in pi's intercom list. Multi-agent coordination across both tools \u2014 coordinators, supervisors, subagents \u2014 via pi-intercom and the Claude Code cross-session protocol. No modifications to either tool.",
+  "description": "Session-to-session messaging between pi coding-agent and Claude Code: one bridge recipient in Claude Code routes to your pi sessions and your Claude Code sessions appear in pi's intercom list. Multi-agent coordination across both tools \u2014 coordinators, supervisors, subagents \u2014 via pi-intercom and the Claude Code cross-session protocol. No modifications to either tool.",
   "type": "module",
   "license": "MIT",
   "keywords": [
@@ -40,7 +40,7 @@
     "extensions": [
       "./extensions/index.ts"
     ],
-    "image": "./docs/screenshots/cc-list-agents.png"
+    "image": "./docs/screenshots/pi-intercom-list.png"
   },
   "bin": {
     "pi-cc-bridge": "./bin/pi-cc-bridge.mjs"
@@ -49,7 +49,7 @@
     "start": "tsx src/cli.ts",
     "test": "tsx --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
-    "build": "esbuild src/cli.ts --external:fs-ext --bundle --platform=node --format=esm --outfile=dist/cli.mjs && esbuild src/holder.ts --bundle --platform=node --format=esm --outfile=dist/holder.mjs",
+    "build": "esbuild src/cli.ts --external:fs-ext --bundle --platform=node --format=esm --outfile=dist/cli.mjs",
     "prepublishOnly": "npm run typecheck && npm run build && npm test",
     "prepare": "npm run build"
   },

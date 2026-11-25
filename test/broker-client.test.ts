@@ -62,3 +62,34 @@ test("broker client: register, list, send, receive, receipt, delivered", { skip:
   const delivery = await Promise.race([delivered, sleep(5_000).then(() => null)]);
   assert.equal(delivery, "msg-1");
 });
+
+test("exact broker sends never fall back to an alias or a rebound endpoint", { skip: SKIP_REASON }, async t => {
+  const { agentDir, stop } = await startIsolatedBroker();
+  const [sender, oldTarget, rebound, mirror] = Array.from({ length: 4 }, () => new BrokerClient(agentDir));
+  t.after(() => { for (const client of [sender, oldTarget, rebound, mirror]) client.close(); stop(); });
+  await sender.connectAndRegister("sender", registration("sender"));
+  await mirror.connectAndRegister("cc-mirror", registration("pi-id"));
+  const seen = new Promise<import("../src/intercom/client.ts").BrokerSessionInfo>(resolve => {
+    sender.on("session_joined", event => { if (event.session.id === "pi-id") resolve(event.session); });
+  });
+  await oldTarget.connectAndRegister("pi-id", registration("target"));
+  const target = await seen;
+  assert.equal(sender.supportsExactSend, true);
+  assert.ok(target.endpointEpoch);
+  const failures: string[] = [];
+  const unexpected: string[] = [];
+  sender.on("delivery_failed", event => failures.push(event.reason));
+  for (const client of [mirror, rebound]) client.on("message", event => unexpected.push(event.message.id));
+  const departed = new Promise<void>(resolve => sender.once("session_left", () => resolve()));
+  oldTarget.close();
+  await departed;
+  const send = (id: string) => sender.sendExact(target, { id, timestamp: Date.now(), content: { text: "must not arrive" } });
+  send("departed");
+  assert.ok(await waitFor(() => failures.length === 1));
+  assert.match(failures[0], /not found/i);
+  await rebound.connectAndRegister("pi-id", registration("target"));
+  send("rebound");
+  assert.ok(await waitFor(() => failures.length === 2));
+  assert.match(failures[1], /endpoint changed/i);
+  assert.deepEqual(unexpected, []);
+});

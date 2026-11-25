@@ -7,7 +7,7 @@ To: nicobailon (pi-intercom) · draft issue text, to be posted under mauro's acc
 pi-cc-bridge (https://github.com/…/pi-cc-bridge) bridges Claude Code's cross-session
 messaging into pi-intercom: a small daemon registers synthetic intercom sessions for live
 Claude Code sessions (one broker connection per peer, sessionId `cc-<ccSessionId>`) and
-masquerades as a CC session so CC can address pi sessions natively. It speaks the broker
+publishes one CC-recipient record so CC can address the bridge natively. It speaks the broker
 protocol as shipped in 0.17.0 — no changes were needed to make it work (thank you for the
 clean seam: client-asserted registrations are exactly what made a companion possible).
 

@@ -99,7 +99,7 @@ export class ClaudeJobs {
         if (message.type === "spawned") {
           job.binding!.watchWorker(job.sessionId, message.pid);
           this.send(job, { type: "input", text: jobInstructions({ nonce: job.nonce,
-            parentTarget: job.binding!.parentTarget, funnelName: job.binding!.funnelName,
+            parentTarget: job.binding!.parentTarget, bridgeName: job.binding!.bridgeName,
             scope: options.scope as string, runId: input.runId, stepIndex: input.stepIndex }) + "\n\nTask:\n" + input.prompt });
         } else if (message.type === "line") {
           try {

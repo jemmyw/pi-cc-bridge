@@ -18,6 +18,7 @@ import { join } from "node:path";
 
 export const INTERCOM_PROTOCOL_NAME = "pi-intercom";
 export const INTERCOM_PROTOCOL_VERSION = 1;
+const EXACT_SEND_FEATURE = "exact-send-v1";
 
 export interface SessionRegistration {
   name?: string;
@@ -82,6 +83,7 @@ export class BrokerClient extends EventEmitter {
   private onData: ((data: Buffer) => void) | null = null;
   private heartbeat: NodeJS.Timeout | null = null;
   private registered = false;
+  private features: string[] = [];
   private heartbeatIntervalMs = 10_000;
   listSeq = 0;
 
@@ -94,6 +96,10 @@ export class BrokerClient extends EventEmitter {
 
   get isRegistered(): boolean {
     return this.registered;
+  }
+
+  get supportsExactSend(): boolean {
+    return this.isRegistered && this.features.includes(EXACT_SEND_FEATURE);
   }
 
   get isConnected(): boolean {
@@ -175,7 +181,10 @@ export class BrokerClient extends EventEmitter {
     }
     const event = msg as BrokerEvent;
     if (event && typeof event === "object" && "type" in event) {
-      if (event.type === "registered") this.registered = true;
+      if (event.type === "registered") {
+        this.registered = true;
+        this.features = Array.isArray(event.features) ? event.features : [];
+      }
       if (event.type === "error") this.log(`broker error: ${event.error}${event.code ? ` (${event.code})` : ""}`);
       this.emit(event.type, event);
     }
@@ -183,6 +192,11 @@ export class BrokerClient extends EventEmitter {
 
   send(to: string, message: IntercomMessage): void {
     this.rawSend({ type: "send", to, message });
+  }
+
+  sendExact(target: Pick<BrokerSessionInfo, "id" | "endpointEpoch">, message: IntercomMessage): void {
+    if (!this.supportsExactSend || !target.endpointEpoch) throw new Error("exact Intercom delivery unavailable");
+    this.rawSend({ type: "send", to: target.id, targetId: target.id, targetEpoch: target.endpointEpoch, message });
   }
 
   list(): string {

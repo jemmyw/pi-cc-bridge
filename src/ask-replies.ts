@@ -65,5 +65,5 @@ export class AskReplies {
 }
 
 export function askInstructions(token: string): string {
-  return `[Bridge ask: reply using SendMessage to this sender. Start your reply payload with exactly "Bridge-Reply: ${token}" on its own line, followed by your answer. For the funnel, keep its required To: line before Bridge-Reply. Do not reuse this token for notifications or later replies.]`;
+  return `[Bridge ask: reply using SendMessage to this sender. After the required To: line, use exactly "Bridge-Reply: ${token}" on its own line, followed by your answer. Do not reuse this token for notifications or later replies.]`;
 }

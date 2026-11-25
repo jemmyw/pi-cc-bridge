@@ -1,130 +1,66 @@
-/**
- * Pure routing helpers, extracted so the funnel/holder addressing rules are
- * table-testable (P1-8, P1-16).
- */
-
 export interface RosterEntryLike {
   id: string;
   name?: string;
 }
 
-/**
- * Parse a leading `To: <target>` header. Case-SENSITIVE (prose starting "to:"
- * must not route), single line only, and the target may be a bare alias or a
- * `pi-<alias>` entry name. Returns undefined when absent.
- */
-export function parseToHeader(text: string): { target: string; rest: string } | undefined {
-  const m = text.match(/^To:[ \t]*(\S+)[ \t]*(?:\r?\n|$)/);
-  if (!m) return undefined;
-  return { target: m[1], rest: text.slice(m[0].length) };
+const bareAddress = /^[a-zA-Z0-9_.:#-]+$/;
+
+export function isPiSession(session: RosterEntryLike): boolean {
+  return !session.id.startsWith("cc-");
 }
 
-/**
- * Resolve an address against the roster. Accepts: broker session id, intercom
- * alias (session.name), and `pi-<alias>` (holder entry spelling). Case-
- * insensitive. Returns the session id.
- */
-export function matchTarget(wanted: string, roster: Iterable<RosterEntryLike>): string | undefined {
-  const lower = wanted.toLowerCase();
-  const bare = lower.startsWith("pi-") ? lower.slice(3) : lower;
-  for (const session of roster) {
-    const name = session.name?.toLowerCase();
-    if (session.id.toLowerCase() === lower || name === lower || name === bare) return session.id;
+export function toLineForId(id: string): string {
+  return `To: ${JSON.stringify(id).replace(/\u2028/g, "\\u2028").replace(/\u2029/g, "\\u2029")}`;
+}
+
+export function parseToHeader(text: string): { target: string; exact: boolean; rest: string } | undefined {
+  const newline = text.indexOf("\n");
+  const firstLine = (newline === -1 ? text : text.slice(0, newline)).replace(/\r$/, "");
+  if (!firstLine.startsWith("To:")) return undefined;
+  const address = firstLine.slice(3).replace(/^[ \t]+|[ \t]+$/g, "");
+  const rest = newline === -1 ? "" : text.slice(newline + 1);
+  if (bareAddress.test(address)) return { target: address, exact: false, rest };
+  if (address.startsWith('"')) {
+    try {
+      const target: unknown = JSON.parse(address);
+      if (typeof target === "string" && target) return { target, exact: true, rest };
+    } catch { /* Invalid quoted ID. */ }
   }
   return undefined;
 }
 
-/** Glob-ish alias matching for `expose` config entries ("*" and prefix*). */
-export function aliasExposed(alias: string, patterns: string[]): boolean {
-  return patterns.some(p => (p === "*" ? true : p.endsWith("*") ? alias.startsWith(p.slice(0, -1)) : p === alias));
+function resolve<T extends RosterEntryLike>(target: string, exact: boolean, roster: T[]): T | "ambiguous" | undefined {
+  const byId = roster.find(session => session.id === target);
+  if (byId && !isPiSession(byId)) return undefined;
+  if (exact) return byId;
+  const lower = target.toLowerCase();
+  const matches = roster.filter(session => isPiSession(session) && (session === byId || session.name?.toLowerCase() === lower));
+  return matches.length > 1 ? "ambiguous" : matches[0];
 }
 
-/** Map a raw pi presence status onto CC's two-value record status. (P1-5) */
-export function toCcStatus(status: string | undefined): "idle" | "busy" {
-  if (!status || status === "idle" || status.startsWith("idle")) return "idle";
-  return "busy";
-}
-
-import { createHash } from "node:crypto";
-import { basename } from "node:path";
-
-/**
- * CC's own derived-name convention (captured from live records:
- * nameSource "derived" → `<basename(cwd)>-<2 lowercase hex>`), applied to pi
- * sessions without a /alias so CC never sees machine-UUID strangers.
- */
-export function derivedCcName(sessionId: string, cwd: string | undefined): string {
-  const dir = cwd?.split("/").filter(Boolean).pop() ?? "session";
-  return `${dir}-${createHash("md5").update(sessionId).digest("hex").slice(0, 2)}`;
-}
-
-/** pi-intercom's runtime fallback alias prefix — never show it to CC. */
-export function isFallbackAlias(name: string): boolean {
-  return name.startsWith("subagent-chat-");
-}
-
-/**
- * Stable holder-alias allocation (P1-2): a session keeps its alias across
- * presence storms, the session's own holder never counts as a collision, and
- * CC-namespace `pi-*` names are respected. Suffixes start at #2.
- */
-export function allocateHolderAlias(params: {
-  session: { id: string; name?: string };
-  holders: { piSessionId: string; alias: string }[];
-  ccPiNames: string[]; // bare aliases claimed by CC-namespace `pi-*` records
-  peerName: string; // funnel name, e.g. "pi-bridge"
-  /** Base name for sessions without a usable alias (CC-derived convention). */
-  unnamedBase?: string;
-}): string {
-  const rawName = params.session.name?.trim();
-  const base = (rawName && !isFallbackAlias(rawName)
-    ? rawName
-    : params.unnamedBase ?? `sid-${params.session.id.slice(0, 8)}`
-  ).replace(/[^\w.-]/g, "-");
-  const taken = new Set<string>([
-    ...params.holders.filter(h => h.piSessionId !== params.session.id).map(h => h.alias),
-    ...params.ccPiNames,
-    params.peerName.replace(/^pi-/, ""),
-  ]);
-  const current = params.holders.find(h => h.piSessionId === params.session.id)?.alias;
-  if (current && (current === base || current.startsWith(`${base}#`)) && !taken.has(current)) return current;
-  if (!taken.has(base)) return base;
-  let n = 2;
-  while (taken.has(`${base}#${n}`)) n++;
-  return `${base}#${n}`;
-}
-
-type FunnelRoute = { text: string } & (
-  | { reason: "to-hit" | "route-to-hit" | "single"; target: string }
-  | { reason: "to-miss"; target: undefined; requested: string }
-  | { reason: "several"; target: undefined; count: number }
-  | { reason: "zero"; target: undefined }
-);
-
-/**
- * Funnel routing (P1-8): explicit `To:` header (case-sensitive, single line)
- * resolves or HOLDS — an explicit address never reroutes. Then `routeTo`, then
- * a single other non-CC session. ccPrefix = the synthetic-peer id prefix.
- */
-export function routeFunnel(
-  text: string,
-  roster: Iterable<RosterEntryLike>,
-  routeTo: string | undefined,
-  ccPrefix = "cc-",
-): FunnelRoute {
+export function addressLines(roster: Iterable<RosterEntryLike>): string[] {
   const sessions = [...roster];
+  return sessions.filter(isPiSession).map(session => {
+    const name = session.name;
+    const safeName = name && bareAddress.test(name) && !name.startsWith("subagent-chat-") &&
+      sessions.filter(other => isPiSession(other) && other.name?.toLowerCase() === name.toLowerCase()).length === 1 &&
+      !sessions.some(other => other !== session && other.id.toLowerCase() === name.toLowerCase());
+    return safeName ? `To: ${name}` : toLineForId(session.id);
+  }).sort();
+}
+
+type PiRoute<T> = { target: T; text: string; reason?: never } |
+  { target?: never; reason: "missing" | "empty" | "unknown" | "ambiguous"; requested?: string };
+
+export function routeToPi<T extends RosterEntryLike>(text: string, roster: Iterable<T>): PiRoute<T> {
   const parsed = parseToHeader(text);
-  if (parsed) {
-    const hit = matchTarget(parsed.target, sessions);
-    if (!hit) return { reason: "to-miss", target: undefined, requested: parsed.target, text };
-    return { reason: "to-hit", target: hit, text: parsed.rest };
-  }
-  if (routeTo) {
-    const hit = matchTarget(routeTo, sessions);
-    if (hit) return { reason: "route-to-hit", target: hit, text };
-  }
-  const others = sessions.filter(s => !s.id.startsWith(ccPrefix));
-  if (others.length === 1) return { reason: "single", target: others[0].id, text };
-  if (others.length > 1) return { reason: "several", target: undefined, count: others.length, text };
-  return { reason: "zero", target: undefined, text };
+  if (!parsed) return { reason: "missing" };
+  const target = resolve(parsed.target, parsed.exact, [...roster]);
+  if (!target || target === "ambiguous") return { reason: target ?? "unknown", requested: parsed.target };
+  if (!parsed.rest.trim()) return { reason: "empty" };
+  return { target, text: parsed.rest };
+}
+
+export function toCcStatus(status: string | undefined): "idle" | "busy" {
+  return !status || status.startsWith("idle") ? "idle" : "busy";
 }

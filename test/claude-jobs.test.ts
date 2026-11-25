@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { ClaudeJobs, type JobStart, type ProviderDependencies } from "../src/claude-jobs/provider.ts";
-import { claudeJobArgs, parseJobEvent, WRITER_TOOLS, type TurnState } from "../src/claude-jobs/protocol.ts";
+import { claudeJobArgs, jobInstructions, parseJobEvent, WRITER_TOOLS, type TurnState } from "../src/claude-jobs/protocol.ts";
 import { loadProviderApi, registerClaudeJobs } from "../extensions/claude-jobs.ts";
 import { bindJob } from "../src/claude-jobs/binding.ts";
 import { isPidAlive } from "../src/cc/registry.ts";
@@ -31,7 +31,7 @@ function fixture(mode = "wait", extra: ProviderDependencies = {}) {
   const jobs = new ClaudeJobs(owner, {
     bind: async args => {
       lost = args.onLost; launches++;
-      return { parentTarget: "caller", funnelName: "test-funnel", watchWorker() {}, close() {} };
+      return { parentTarget: "caller", bridgeName: "test-bridge", watchWorker() {}, close() {} };
     }, command: resolve("test/fixtures/fake-claude-launcher.mjs"),
     env: { ...process.env, FAKE_CLAUDE_MODE: mode }, ...extra,
   });
@@ -137,6 +137,13 @@ for (const patch of invalidCompletionEvents) {
     assert.equal(jobs.result(handle.providerJobId).output, undefined);
   });
 }
+
+test("claude jobs instructions address the bridge and quote the exact parent ID", () => {
+  const parentTarget = 'parent "id"';
+  const prompt = jobInstructions({ nonce: "token", parentTarget, bridgeName: "bound-bridge", scope: "test", runId: "run", stepIndex: 0 });
+  assert.match(prompt, /find exactly "bound-bridge"/);
+  assert.ok(prompt.split("\n").includes(`To: ${JSON.stringify(parentTarget)}`));
+});
 
 test("claude jobs args preserve writer permissions, empty MCP, no browser and launch-only inbound acceptance", () => {
   const args = claudeJobArgs("id", "name");
@@ -294,7 +301,7 @@ test("claude jobs binding: real broker pins exact parent and bridge identities, 
   mkdirSync(recordsDir);
   writeFileSync(join(dir, "pi-cc-bridge/daemon.lock"), `${process.pid} ${procStart()}`);
   const record = { pid: process.pid, procStart: procStart(), sessionId: randomUUID(), kind: "bridge", bridgeOwner: "pi-cc-bridge",
-    name: "pinned-funnel", messagingSocketPath: join(dir, "funnel.sock") };
+    name: "pinned-bridge", messagingSocketPath: join(dir, "bridge.sock") };
   const recordPath = join(recordsDir, `${process.pid}.json`);
   writeFileSync(recordPath, JSON.stringify(record));
   const broker = await startBrokerAt(dir);
@@ -305,7 +312,7 @@ test("claude jobs binding: real broker pins exact parent and bridge identities, 
   const args = { agentDir: dir, ccSessionsDir: recordsDir, parentTarget: "exact-parent", cwd: process.cwd(), callerPid: process.pid, onLost: () => { lost++; } };
   const binding = await bindJob(args);
   t.after(() => binding.close());
-  assert.equal(binding.funnelName, "pinned-funnel");
+  assert.equal(binding.bridgeName, "pinned-bridge");
   assert.equal(binding.parentTarget, "exact-parent");
   await assert.rejects(bindJob({ ...args, parentTarget: "other-owner" }), /default broker ID/);
   await assert.rejects(bindJob({ ...args, callerPid: process.pid + 1 }), /parent missing/);

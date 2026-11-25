@@ -1,22 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { randomUUID } from "node:crypto";
 import { startBrokerAt, resolveTsx, waitFor, SKIP, SKIP_REASON } from "./helpers.ts";
-import { BrokerClient } from "../src/intercom/client.ts";
+import { BrokerClient, type BrokerSessionInfo } from "../src/intercom/client.ts";
 import net from "node:net";
-
-/**
- * Lifecycle integration (critic P0-2/P0-3/P1-1):
- *  1. broker restart → peers re-register: the holder vanishes while the broker
- *     is down (peer disconnect → roster cleared) and returns after reconnect.
- *  2. two daemons racing → exactly one survives (kernel flock).
- *  3. holder SIGKILL → respawned with a fresh pid.
- */
 
 const PKG_DIR = new URL("..", import.meta.url).pathname;
 const skip = SKIP ? SKIP_REASON : false;
@@ -74,18 +66,6 @@ function startDaemon(agentDir: string): ChildProcess {
   });
 }
 
-function holderRecordInfo(sessionsDir: string): { file: string; record: Record<string, unknown> } | undefined {
-  for (const f of readdirSync(sessionsDir)) {
-    try {
-      const rec = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8")) as Record<string, unknown>;
-      if (rec.name === "pi-planner" && rec.kind === "bridge") return { file: f, record: rec };
-    } catch {
-      /* torn read */
-    }
-  }
-  return undefined;
-}
-
 function registerPlanner(agentDir: string): Promise<BrokerClient> {
   return new Promise(async (resolve, reject) => {
     const client = new BrokerClient(agentDir);
@@ -107,15 +87,15 @@ function registerPlanner(agentDir: string): Promise<BrokerClient> {
   });
 }
 
-test("lifecycle: broker restart, double daemon, holder crash", { skip }, async t => {
+test("lifecycle: broker restart reconnects the mirror without replacing the single bridge", { skip }, async t => {
   const agentDir = mkdtempSync(join(tmpdir(), "ccbridge-life-"));
   const { sessionsDir, mySocketPath, myServer } = freshFixture(agentDir);
-  t.after(() => myServer.close());
+  await new Promise<void>(resolve => myServer.listen(mySocketPath, resolve));
   const stateDir = join(agentDir, "pi-cc-bridge");
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
   writeFileSync(
     join(stateDir, "config.json"),
-    JSON.stringify({ enabled: true, pollMs: 250, expose: ["*"], maxHolders: 8, ccSessionsDir: sessionsDir, ccSocketDir: join(agentDir, "cc-run") }),
+    JSON.stringify({ enabled: true, pollMs: 250, ccSessionsDir: sessionsDir, ccSocketDir: join(agentDir, "cc-run") }),
   );
 
   let broker = await startBrokerAt(agentDir);
@@ -123,14 +103,13 @@ test("lifecycle: broker restart, double daemon, holder crash", { skip }, async t
   // Two daemons race: exactly one owns the guard (P0-3).
   const d1 = startDaemon(agentDir);
   const d2 = startDaemon(agentDir);
-  t.after(() => {
-    for (const d of [d1, d2]) {
-      try {
-        d.kill("SIGKILL");
-      } catch {
-        /* gone */
-      }
+  t.after(async () => {
+    for (const child of [d1, d2, broker]) {
+      child.kill("SIGTERM");
+      await waitFor(() => child.exitCode !== null || child.signalCode !== null);
     }
+    myServer.close();
+    rmSync(agentDir, { recursive: true, force: true });
   });
   let exits = 0;
   const onExit = () => exits++;
@@ -143,49 +122,25 @@ test("lifecycle: broker restart, double daemon, holder crash", { skip }, async t
   assert.equal(survivors.length, 1, "lock owner survives");
   const daemon = survivors[0];
 
-  let planner = await registerPlanner(agentDir);
-  t.after(() => planner.close());
-
-  // Holder appears for the exposed pi session.
-  const firstHolder = await waitFor(() => holderRecordInfo(sessionsDir) !== undefined, 15_000);
-  assert.ok(firstHolder, "holder record must exist");
-  const initial = holderRecordInfo(sessionsDir)!;
-
-  // ── 3. holder SIGKILL → respawn with a fresh pid (P1-1) ──
-  process.kill(Number(initial.record.pid), "SIGKILL");
-  const aliveWithPid = (pid: number) => {
+  const bridgeFile = join(sessionsDir, `${daemon.pid}.json`);
+  async function assertMirror() {
+    const planner = await registerPlanner(agentDir);
     try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
+      let mirrored = false;
+      planner.on("sessions", event => { mirrored ||= event.sessions.some((session: BrokerSessionInfo) => session.name === "claude:test-cc"); });
+      planner.on("session_joined", event => { mirrored ||= event.session.name === "claude:test-cc"; });
+      planner.list();
+      assert.ok(await waitFor(() => mirrored, 20_000), "Claude peer registers on the broker");
+    } finally {
+      planner.close();
     }
-  };
-  const respawn = await waitFor(() => {
-    for (const f of readdirSync(sessionsDir)) {
-      try {
-        const rec = JSON.parse(readFileSync(join(sessionsDir, f), "utf-8")) as Record<string, unknown>;
-        if (rec.name === "pi-planner" && rec.kind === "bridge" && Number(rec.pid) !== Number(initial.record.pid) && aliveWithPid(Number(rec.pid))) {
-          return true;
-        }
-      } catch {
-        /* torn read */
-      }
-    }
-    return false;
-  }, 20_000);
-  assert.ok(respawn, "crashed holder must be respawned with a fresh pid");
-
-  // ── 1. broker restart → holder vanishes while down, returns after reconnect (P0-2) ──
+  }
+  await assertMirror();
+  const initial = readFileSync(bridgeFile, "utf-8");
   broker.kill("SIGTERM");
-  const gone = await waitFor(() => holderRecordInfo(sessionsDir) === undefined, 10_000);
-  assert.ok(gone, "losing the broker must tear down holders (no zombies)");
-  broker = await startBrokerAt(agentDir); // restart in place
-  t.after(() => broker.kill("SIGTERM"));
-  // The planner client must also reconnect to the new broker (sessions do).
-  planner.close();
-  await registerPlanner(agentDir);
-  const back = await waitFor(() => holderRecordInfo(sessionsDir) !== undefined, 20_000);
-  assert.ok(back, "peers must re-register and holders return after broker restart");
-  assert.ok(daemon.exitCode === null, "daemon must survive a broker outage");
+  assert.ok(await waitFor(() => broker.exitCode !== null || broker.signalCode !== null));
+  broker = await startBrokerAt(agentDir);
+  await assertMirror();
+  assert.equal(readFileSync(bridgeFile, "utf-8"), initial);
+  assert.equal(daemon.exitCode, null);
 });

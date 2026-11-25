@@ -23,9 +23,9 @@ No untrusted command, executable, argv, environment, model or shell template opt
 
 ## Decisions, steering and completion
 
-The worker discovers the verified daemon's uniquely named Claude funnel, then uses native SendMessage with `To: <exact parent UUID>` before every payload. This works with bridge `expose: []`, before a holder exists. The funnel name/socket/session identity is pinned against the verified daemon lock/record; parent broker pid/cwd/endpoint epoch and worker route are checked. Missing, rebound or disconnected identities cancel the job; no peer fallback or broadcast.
+The worker discovers the verified daemon's uniquely named Claude recipient, then uses SendMessage with `To: "<exact parent UUID>"` before every payload. The bridge name/socket/session identity is pinned against the verified daemon lock/record; parent broker pid/cwd/endpoint epoch and worker route are checked. Missing, rebound or disconnected identities cancel the job; no peer fallback or broadcast.
 
-Reply through normal intercom to the **exact sender `cc-<Claude session UUID>`** shown on the question. The bridge creates the parent's native holder lazily. This is cross-session messaging, not pi-subagents native `contact_supervisor` support. The existing exact Bridge-Reply ask protocol remains unchanged.
+Reply through normal intercom to the **exact sender `cc-<Claude session UUID>`** shown on the question. This is cross-session messaging, not pi-subagents native `contact_supervisor` support. The existing exact Bridge-Reply ask protocol remains unchanged.
 
 The worker emits a nonce-bound `WAIT` assistant marker when awaiting a decision. The provider keeps state `running`, never terminal `blocked`. `claude_job_control` reports its cooperative phase. Intermediate Claude result events do not finish the job. Only the matching `DONE` assistant marker followed by a successful matching Claude result completes it and closes the process. These markers describe trusted model intent, not proof of task correctness or approval.
 
@@ -58,4 +58,4 @@ npm run build
 PI_CODING_AGENT_DIR=/path/to/active/profile PI_INTERCOM_DIR=/path/to/pi-intercom npx tsx scripts/claude-jobs-smoke.ts
 ```
 
-The live smoke asks a decision through the native funnel before first parent contact, verifies no early edit, replies through the exact synthetic peer and checks the retained-context edit and explicit completion. It does not use stdin to fake the answer. Deterministic tests exercise the real installed stock external-job runner/request bridge as well as fake Claude subprocesses. No normal session is messaged by the smoke. Review and live acceptance remain required before operational use.
+The live smoke asks a decision through the bridge before first parent contact, verifies no early edit, replies through the exact synthetic peer and checks the retained-context edit and explicit completion. It does not use stdin to fake the answer. Deterministic tests exercise the real installed stock external-job runner/request bridge as well as fake Claude subprocesses. No normal session is messaged by the smoke. Review and live acceptance remain required before operational use.

@@ -4,15 +4,15 @@
 > this bridge only speaks its protocol; pi-intercom itself required zero changes.
 
 Bridge **pi-intercom** (pi sessions) and **Claude Code cross-session messaging** (CC sessions)
-so both sides appear as native peers to each other.
+using a single recipient on the Claude side.
 
 - pi direction: a companion daemon registers synthetic pi-intercom peer sessions, one per live
   Claude Code session. pi sessions message `claude:<name>` through pi-intercom as usual.
 - CC direction: the same daemon masquerades as a Claude Code session (registry record + inbox
   socket), so CC sessions see `pi-bridge` in `/list-agents` and `SendMessage` to it natively.
 
-Both transports were verified live on Claude Code 2.1.296 / pi-intercom 0.17.0
-(probes archived in `docs/probes/`, fixtures used by `test/`).
+The original wire shapes were captured on Claude Code 2.1.296 / pi-intercom 0.17.0
+(`docs/probes/`). Current isolated relay tests use pi-intercom 0.18.1.
 
 ## Architecture
 
@@ -115,7 +115,7 @@ loops are rate-limited (drop identical repeats, queue ≤ 50).
 Recommendation for CC worker sessions that should accept pi traffic unattended:
 `claude -p … --settings '{"crossSessionInbound":"accept"}'` or set it in the CC session.
 
-## pi-intercom protocol (broker 0.17.0)
+## pi-intercom protocol
 
 - Endpoint: `~/.pi/agent/intercom/broker.sock` (Unix), `broker.port.json` (Windows TCP).
 - Frames: 4-byte big-endian length + JSON payload (see pi-intercom `broker/framing.ts`).
@@ -125,7 +125,7 @@ Recommendation for CC worker sessions that should accept pi traffic unattended:
   `{type:"message_receipt", receipt:{messageId,status:"receiver_received"}}`;
   heartbeat = any frame ≥ `livenessIntervalMs` (send `{type:"presence"}`).
 - `sessionId`: any non-empty string (`cc-<ccSessionId>` for synthetic peers; stable across
-  daemon restarts; a dead previous holder is evicted automatically).
+  daemon restarts).
 - `SessionRegistration` requires `cwd`, `model`, `pid`, `startedAt`, `lastActivity`
   (strings/numbers), optional `name`, `status`, `acknowledgesReceipts`, `livenessIntervalMs`.
 - One registered session per connection (`currentKey`), so the daemon opens one broker
@@ -138,42 +138,32 @@ Recommendation for CC worker sessions that should accept pi traffic unattended:
 | CC session record `<pid>.json` | Synthetic intercom session `cc-<sessionId>`, name `claude:<name>` (fallback `claude-pid-<pid>`; `#<pid>` suffix on name collisions) |
 | CC `status` | intercom presence `status` (idle/busy) |
 | CC→pi message | relayed by the *sender peer's* connection, so pi sees `from = claude:<name>` |
-| pi→CC message | from the pi session's **holder socket**, `from-name = pi-<alias>` (funnel fallback: `peerName` + `To:` hint in text); `from-mode` = `piSenderMode` (default `bypass`) |
+| pi→CC message | From the daemon inbox socket and `peerName`; `from-mode` is `piSenderMode` (default `bypass`). Attribution and the exact reply `To:` line precede the unchanged payload. |
 | pi→CC text | wrapped in `<cross-session-message>` exactly like a native CC sender |
 | CC→pi text | wrapper stripped, replaced with a `Message from Claude Code session <name>` prefix |
 
-### CC → pi routing — native entries (default)
+### Claude to Pi addressing
 
-With `nativeEntries: true` the daemon spawns one **holder child** per live pi session.
-Each child binds its own CC inbox socket and writes its own registry record named
-`pi-<alias>`, so `/list-agents` shows every pi session natively and CC `SendMessage`s it
-directly — no `To:` header needed. Holder records carry `kind: "bridge"` and mirror the
-pi session's status (busy/idle) and alias renames, pushed from the daemon over private
-IPC (`~/.pi/agent/pi-cc-bridge/holders-ipc.sock`).
+Send `/list` to the bridge recipient to see all real Pi sessions in the current
+Intercom roster. The daemon reads an initial snapshot from a mirrored peer and
+tracks joins, leaves and presence changes; synthetic `cc-` peers are excluded.
+Copy a returned `To:` line into the first line of the message to the bridge.
+Bare addresses match exact IDs or case-insensitive aliases and must be unique.
+A JSON-quoted address matches only the exact ID. List entries use unique safe
+aliases or quoted IDs; reply and job instructions always use quoted IDs.
 
-Children are deliberately dumb socket-holders with **no broker connection**: they forward
-frames to the daemon, which relays via the *sending CC session's own* synthetic peer
-connection — attribution stays `Message from Claude Code session <name>` and no extra
-intercom sessions are created. A watchdog makes children self-clean (registry record +
-socket) if the daemon dies. Prebuilt bundle `dist/holder.mjs` (plain node, ~53 MB RSS)
-is preferred over the tsx fallback (~82 MB); `npm run build` regenerates it,
-`prepublishOnly` enforces it.
-
-Routing inside a holder entry: a `To: <alias>` header is honored for cross-routing;
-otherwise the message belongs to that pi session. `list` replies with the roster.
-Unroutable funnel messages are held in `~/.pi/agent/pi-cc-bridge/held/` — never guessed.
-
-### Funnel fallback (kept for compatibility)
-
-The masquerade record `peerName` (default `pi-bridge`) remains: `SendMessage` to it with a
-leading `To: <alias>` line, or `routeTo` in config, or — when exactly one other pi session
-is connected — that session.
+There is no last-sender, single-session or configured default. Invalid, missing,
+unknown and ambiguous addresses are held and the validated sender is notified.
+The bridge requires the negotiated `exact-send-v1` capability and target
+`endpointEpoch` for each relay. The broker rejects departed or rebound endpoints
+instead of falling back to an alias or partial ID. Broker failures and missing
+receipts are held and reported to the original sender.
 
 ## Runtime layout
 
 ```
 ~/.pi/agent/pi-cc-bridge/
-├── config.json        # { enabled, peerName, pollMs, routeTo, logLevel, ccSessionsDir? }
+├── config.json        # { enabled, peerName, pollMs, logLevel, ccSessionsDir? }
 ├── daemon.lock        # owner metadata: `pid procStart`
 ├── daemon.lock.guard  # permanent private inode, kernel flock held for daemon lifetime
 ├── daemon.log
@@ -181,8 +171,7 @@ is connected — that session.
 ```
 
 Signal handling: SIGTERM/SIGINT → remove own CC registry record + socket, unregister broker
-sessions, exit. Startup GC: remove a leftover record whose `messagingSocketPath` is our own
-path and whose pid is dead (our previous incarnation only — never other sessions' records).
+sessions, exit. Startup GC removes only records marked `bridgeOwner` whose PID is dead.
 
 ## Claude Code side (plugin)
 
@@ -190,8 +179,8 @@ path and whose pid is dead (our previous incarnation only — never other sessio
 `skills/pi-bridge/SKILL.md`). It carries no protocol code — CC's native cross-session
 messaging already speaks to the bridge — only awareness:
 
-- how to discover pi sessions (`/list-agents`, `@pi-bridge` mention),
-- the `To: <alias>` routing convention and reply etiquette,
+- how to find the bridge in `/list-agents` and ask it for `/list`,
+- the first-line `To:` convention and exact reply instructions,
 - notes on held-message semantics and `crossSessionInbound`.
 
 Install: `/plugin marketplace add <path-or-repo>` then install `pi-cc-bridge`; or load in
@@ -221,16 +210,17 @@ Both are cosmetic; the current registration format works unmodified today.
   applies verbatim: prompting-mode CC sessions hold pi messages for user approval; only
   bypass↔bypass delivers unattended. Declaring `prompting` is an explicit operator
   assertion the bridge cannot verify.
-- **Inbound mirroring is opt-in** (P1-13, disagreement): `expose` (glob over aliases,
-  default `[]`) decides which pi sessions get a CC-native entry up front. Every pi session
-  that messages CC first gets its holder lazily (contact-driven), so the reply path always
-  exists while cold discovery stays a decision.
-- **Bypass-class CC senders are held** (`ccInbound: "hold-bypass"` default): the bridge
-  applies the same hold CC would, and notifies the sender's socket.
+- **Inbound validation:** The declared sender socket must match a live, non-bridge
+  Claude registry record in the Claude runtime directory. Registry validation is
+  not authentication against other same-UID processes. Relay attribution comes
+  from the matched registry peer, not the claimed display name.
+- **Bypass-class and unknown-mode CC messages are held** by default except
+  `/list`, a rate-limited, read-only query allowed for validated Claude senders
+  of any mode. It returns only addresses and does not inject anything into Pi.
 - **Rate limits** (`relayPerMin`/`relayBurst`, default 6/min burst 3 per direction pair):
   excess traffic is held, not delivered — a CC↔pi agent loop self-extinguishes.
 - Unroutable messages, delivery failures, and rate-limited traffic land in `held/` — the
-  bridge never guesses, and CC's `SendMessage` success is never a lie.
+  bridge never guesses. `SendMessage` success means the Claude socket accepted the write, not that Pi received it.
 - The bridge never touches CC `.key` auth files and never writes or deletes other
   processes' registry records; ownership is marked out-of-band (`bridgeOwner`).
 - Record identity fields are verified against CC's own records at startup

@@ -2,7 +2,7 @@
  * Manual round-trip through an isolated broker and a dedicated Claude probe.
  * Run with tsx scripts/e2e-smoke.ts. Never treats Claude stdout as delivery.
  */
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -12,7 +12,7 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { createRequire } from "node:module";
 import { BrokerClient, type BrokerEvent, type BrokerSessionInfo } from "../src/intercom/client.ts";
 import { BRIDGE_OWNER, ccSessionsDir } from "../src/cc/paths.ts";
-import { isPidAlive, procStart } from "../src/cc/registry.ts";
+import { isPidAlive } from "../src/cc/registry.ts";
 
 const PKG_DIR = fileURLToPath(new URL("..", import.meta.url));
 const requireFromPkg = createRequire(join(PKG_DIR, "package.json"));
@@ -88,15 +88,12 @@ export async function main(): Promise<void> {
   const targetName = `e2e-target-${nonce}`;
   const probeName = `ccbridge-probe-${nonce}`;
   const hello = `CC-TO-PI ${nonce}`;
-  const nativeHello = `NATIVE-CC-TO-PI ${nonce}`;
-  const holderName = `pi-${targetName}`;
   const ping = `PI-TO-CC ${nonce}`;
   const ack = `ACK ${nonce}`;
   const agentDir = mkdtempSync(join(tmpdir(), "ccbridge-e2e-"));
   const children: ChildProcess[] = [];
   const records: { child: ChildProcess; name: string; bridge: boolean }[] = [];
   const diagnostics = new Map<ChildProcess, { role: string; stdout: Buffer; stderr: Buffer }>();
-  const holders = new Map<number, string>();
   let daemon: ChildProcess | undefined;
   let succeeded = false;
   let target: BrokerClient | undefined;
@@ -117,29 +114,6 @@ export async function main(): Promise<void> {
     }
     child.once("error", error => { childFailure = new Error(`${role} spawn failed: ${error.message}`); });
     return child;
-  };
-  const findHolder = (): boolean => {
-    if (!daemon?.pid) return false;
-    for (const file of readdirSync(ccSessionsDir())) {
-      if (!file.endsWith(".json")) continue;
-      let record;
-      try { record = JSON.parse(readFileSync(join(ccSessionsDir(), file), "utf-8")); } catch { continue; }
-      if (record.name !== holderName || record.bridgeOwner !== BRIDGE_OWNER || record.kind !== "bridge") continue;
-      if (!Number.isSafeInteger(record.pid) || record.pid <= 0 || !isPidAlive(record.pid)) continue;
-      let args: string;
-      try {
-        args = execFileSync("/bin/ps", ["-p", String(record.pid), "-o", "args="], { encoding: "utf-8" });
-      } catch (error) {
-        if (!isPidAlive(record.pid)) continue;
-        throw error;
-      }
-      if (!args.includes(`"parentPid":${daemon.pid},`) || !args.includes(`"piSessionId":"${targetName}"`) || !args.includes(agentDir)) continue;
-      const start = procStart(record.pid);
-      if (!start) throw new Error("cannot verify owned holder identity");
-      holders.set(record.pid, start);
-      return true;
-    }
-    return false;
   };
   const waitFor = async (label: string, predicate: () => boolean, timeout = 15_000) => {
     const deadline = Date.now() + timeout;
@@ -163,14 +137,14 @@ export async function main(): Promise<void> {
     mkdirSync(stateDir, { mode: 0o700 });
     writeFileSync(join(stateDir, "config.json"), JSON.stringify({
       enabled: true, peerName, pollMs: 500, logLevel: "normal",
-      piSenderMode: "bypass", ccInbound: "hold-bypass", expose: [targetName], maxHolders: 1,
+      piSenderMode: "bypass", ccInbound: "hold-bypass",
     }), { mode: 0o600 });
     const env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, NODE_NO_WARNINGS: "1" };
     launch("broker", process.execPath, ["--import", tsx, join(intercom, "broker", "broker.ts")], env);
     await waitFor("isolated broker", () => existsSync(join(agentDir, "intercom", "broker.sock")));
     daemon = launch("daemon", process.execPath, ["--import", tsx, join(PKG_DIR, "src", "cli.ts")], env);
     records.push({ child: daemon, name: peerName, bridge: true });
-    await waitFor("dedicated funnel", () => {
+    await waitFor("dedicated bridge", () => {
       try {
         return JSON.parse(readFileSync(join(ccSessionsDir(), `${daemon!.pid}.json`), "utf-8")).name === peerName;
       } catch { return false; }
@@ -202,11 +176,10 @@ export async function main(): Promise<void> {
       "--tools", "ListAgents,SendMessage", "--allowedTools", "ListAgents,SendMessage",
     ]);
     records.push({ child: cc, name: probeName, bridge: false });
-    const prompt = `Use ListAgents to find the session named "${peerName}". Message only "${peerName}" and "${holderName}". ` +
-      `Use SendMessage to send exactly "To: ${targetName}\\n${hello}" to it (replace \\n with a newline). ` +
-      `Then use ListAgents to find "${holderName}" (retry discovery if not visible yet) and send exactly "${nativeHello}" to it. ` +
-      `When you receive a cross-session message from "${holderName}" whose last line is exactly "${ping}", ` +
-      `follow its Bridge ask instruction: send the exact Bridge-Reply token header on its own first line, then "${ack}" on the next line, to "${holderName}". ` +
+    const prompt = `Use ListAgents to find the session named "${peerName}". Message only that bridge. ` +
+      `First send /list and wait for the roster. Use the To line for ${targetName} as the first line, then "${hello}" on the next line. ` +
+      `When you receive a Pi message ending with exactly "${ping}", follow its instructions: reply to the bridge ` +
+      `with the exact To line first, the exact Bridge-Reply token header second, and "${ack}" third. ` +
       `Do not send the ACK before receiving that message.`;
     cc.stdin!.on("error", error => { childFailure = error; });
     cc.stdin!.write(JSON.stringify({ type: "user", message: { role: "user", content: prompt } }) + "\n");
@@ -220,54 +193,25 @@ export async function main(): Promise<void> {
     const record = JSON.parse(readFileSync(join(ccSessionsDir(), `${cc.pid}.json`), "utf-8"));
     const expected = { id: `cc-${record.sessionId}`, name: `claude:${probeName}` };
     await waitFor("Claude peer on isolated broker", () => sessions.get(expected.id)?.name === expected.name);
-    await waitFor("owned native holder record", findHolder);
     await waitFor("CC to pi nonce", () => messages.some(event => isProbeMessage(event, expected, hello)), 120_000);
     console.log("PASS CC to pi: exact nonce received from dedicated Claude peer");
-    await waitFor("native CC to pi nonce", () => messages.some(event => isProbeMessage(event, expected, nativeHello)), 120_000);
-    console.log("PASS native holder discovery and CC to pi delivery");
     assertNoPrematureAck(messages, expected, ack);
     console.log("PASS no premature ACK before pi to CC ping");
     const beforeReply = messages.length;
     const askId = randomUUID();
     target.send(expected.id, { id: askId, expectsReply: true, timestamp: Date.now(), content: { text: ping } });
     await waitFor("pi to CC correlated acknowledgement", () => messages.slice(beforeReply).some(event => isProbeReply(event, expected, ack, askId)), 120_000);
-    console.log("PASS native pi to CC ask: exact ACK and original replyTo received through broker from dedicated Claude peer");
+    console.log("PASS Pi to CC ask through the bridge: exact ACK and original replyTo received through broker from dedicated Claude peer");
     succeeded = true;
   } finally {
     const errors: unknown[] = [];
-    try { findHolder(); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
-    }
     target?.close();
     for (const child of [...children].reverse()) {
       try { await stop(child); } catch (error) { errors.push(error); }
     }
-    for (const [pid, start] of holders) {
-      try {
-        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-          if (!isPidAlive(pid)) break;
-          if (procStart(pid) !== start) throw new Error(`holder pid ${pid} identity changed`);
-          process.kill(pid, signal);
-          const deadline = Date.now() + 3_000;
-          while (isPidAlive(pid) && Date.now() < deadline) await sleep(100);
-        }
-        cleanRecord(pid, holderName, true);
-        if (existsSync(join(ccSessionsDir(), `${pid}.json`))) throw new Error(`holder record ${pid} remains`);
-      } catch (error) { errors.push(error); }
-    }
     for (const record of records) {
       if (!record.child.pid) continue;
       try { cleanRecord(record.child.pid, record.name, record.bridge); } catch (error) { errors.push(error); }
-    }
-    try {
-      for (const file of readdirSync(ccSessionsDir())) {
-        if (!file.endsWith(".json")) continue;
-        let record;
-        try { record = JSON.parse(readFileSync(join(ccSessionsDir(), file), "utf-8")); } catch { continue; }
-        if (record.name === holderName && record.bridgeOwner === BRIDGE_OWNER) throw new Error(`owned holder record remains: ${file}`);
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") errors.push(error);
     }
     for (const [child, tails] of diagnostics) {
       try {
@@ -282,7 +226,7 @@ export async function main(): Promise<void> {
     if (errors.length) throw new AggregateError(errors, `cleanup incomplete; private diagnostics retained at ${agentDir}`);
     if (succeeded) {
       rmSync(agentDir, { recursive: true, force: true });
-      console.log("PASS owned children and native holder records removed");
+      console.log("PASS owned children and registry records removed");
     } else {
       console.error(`Private smoke diagnostics retained at ${agentDir}`);
     }
